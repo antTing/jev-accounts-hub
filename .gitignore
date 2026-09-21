@@ -1,0 +1,13 @@
+/data
+/jevproxy
+/jevproxy.exe
+.env
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+dist/
+.claude/
+*.local.json
+*.token
+*.key

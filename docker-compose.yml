@@ -1,0 +1,17 @@
+services:
+  jevproxy:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      JEVPROXY_LISTEN: :8080
+      JEVPROXY_DATA_DIR: /data
+      JEVPROXY_ADMIN_TOKEN: ${JEVPROXY_ADMIN_TOKEN:-}
+      JEVPROXY_MASTER_KEY: ${JEVPROXY_MASTER_KEY:-}
+      JEVPROXY_UPSTREAM: ${JEVPROXY_UPSTREAM:-https://api.typesafe.ai}
+      JEVPROXY_TIMEOUT: ${JEVPROXY_TIMEOUT:-15s}
+      JEVPROXY_LOG_FORMAT: json
+      TZ: Asia/Shanghai
+    restart: unless-stopped

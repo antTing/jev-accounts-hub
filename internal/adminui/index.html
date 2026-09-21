@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>jev-hub</title>
+<style>
+  :root {
+    --bg:#0b1020; --card:#141a2e; --line:#243049; --text:#e8eefc; --muted:#8b97b3;
+    --acc:#6ea8ff; --ok:#3dd68c; --bad:#ff6b7a; --warn:#ffcc66; --chip:#1b2440;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.45 ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text)}
+  header{display:flex;align-items:center;justify-content:space-between;padding:16px 22px;border-bottom:1px solid var(--line)}
+  h1{font-size:18px;margin:0;letter-spacing:.04em}
+  h1 span{color:var(--acc)}
+  main{padding:18px 22px 40px;max-width:1280px;margin:0 auto}
+  .row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .k{color:var(--muted);font-size:12px}
+  .v{font-size:22px;margin-top:4px}
+  .sub{color:var(--muted);font-size:12px;margin-top:4px}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px;align-items:center}
+  input,select,button,textarea{font:inherit}
+  input,select,textarea{background:#0e1528;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px}
+  textarea{width:100%;min-height:140px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  button{background:var(--acc);color:#081018;border:0;border-radius:8px;padding:8px 12px;cursor:pointer;font-weight:600}
+  button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+  button.danger{background:var(--bad);color:#1a0000}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .muted{color:var(--muted)} .warn{color:var(--warn)}
+  .tabs{display:flex;gap:8px;margin:8px 0 16px;flex-wrap:wrap}
+  .tabs button{background:#0e1528;color:var(--text);border:1px solid var(--line)}
+  .tabs button.on{background:var(--acc);color:#081018}
+  .hidden{display:none}
+  .plain{background:#0e1528;border:1px dashed var(--acc);padding:10px;border-radius:8px;margin:8px 0;word-break:break-all}
+  dialog{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:12px;padding:16px;min-width:min(560px,92vw);max-width:720px}
+  dialog::backdrop{background:#0008}
+  label{display:block;margin:8px 0 4px;color:var(--muted);font-size:12px}
+  .msg{margin:8px 0;color:var(--warn);white-space:pre-wrap}
+  code{background:#0e1528;padding:2px 6px;border-radius:6px}
+  .gate{max-width:560px;margin:48px auto;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:28px}
+  .gate h2{margin:0 0 8px;font-size:20px}
+  .gate p{color:var(--muted)}
+  .gate input{width:100%;margin:12px 0}
+  .gate button{width:100%}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .chip{display:inline-block;background:var(--chip);border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:12px;color:var(--muted)}
+  pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+  .bars{display:flex;align-items:flex-end;gap:4px;height:64px;margin-top:10px}
+  .bars i{flex:1;background:#2a3a66;border-radius:3px 3px 0 0;min-height:2px}
+  .bars i.ok{background:#2f6b4e}
+  @media (max-width:900px){
+    .row,.split{grid-template-columns:1fr 1fr}
+  }
+  @media (max-width:640px){
+    .row,.split{grid-template-columns:1fr}
+    main{padding:12px}
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>jev<span>-hub</span></h1>
+  <div id="headerAuth" class="hidden" style="display:flex;gap:10px;align-items:center">
+    <span class="muted">交流群 1102910606</span>
+    <span class="muted" id="authState">未登录</span>
+    <button class="ghost" onclick="logout()">退出</button>
+  </div>
+</header>
+<main>
+  <div id="gate" class="gate">
+    <h2>先贴管理口令</h2>
+    <p>服务启动时会把口令写到项目目录的 <code>data/admin.token</code>。在终端执行：</p>
+    <p><code>cat data/admin.token</code></p>
+    <p>把整行复制到下面。不要贴 TypeSafe 的 <code>jev_</code> Key。</p>
+    <input id="token" type="password" placeholder="data/admin.token 里的那一行" autocomplete="off"/>
+    <button onclick="saveToken()">进入管理台</button>
+    <p class="msg" id="gateErr"></p>
+    <p class="muted" style="margin-top:18px">交流 QQ 群：1102910606</p>
+  </div>
+  <div id="app" class="hidden">
+    <div class="row" id="stats"></div>
+    <div class="tabs">
+      <button class="on" data-tab="upstreams" onclick="tab(this)">上游 Key</button>
+      <button data-tab="keys" onclick="tab(this)">用户 Key</button>
+      <button data-tab="logs" onclick="tab(this)">调用日志</button>
+      <button data-tab="play" onclick="tab(this)">试玩</button>
+    </div>
+    <section id="upstreams">
+      <div class="toolbar">
+        <button onclick="openUp()">导入一条</button>
+        <button class="ghost" onclick="openImport()">批量导入</button>
+        <button class="ghost" onclick="probeAll()">全部探活</button>
+        <button class="ghost" onclick="loadAll()">刷新</button>
+      </div>
+      <div class="card"><table id="upTable"></table></div>
+    </section>
+    <section id="keys" class="hidden">
+      <div class="toolbar">
+        <button onclick="openKey()">签发用户 Key</button>
+        <button class="ghost" onclick="loadAll()">刷新</button>
+      </div>
+      <div id="newPlain"></div>
+      <div class="card"><table id="keyTable"></table></div>
+    </section>
+    <section id="logs" class="hidden">
+      <div class="toolbar">
+        <select id="logRange" onchange="loadLogs()">
+          <option value="">全部</option>
+          <option value="1h">最近 1 小时</option>
+          <option value="24h" selected>最近 24 小时</option>
+          <option value="7d">最近 7 天</option>
+        </select>
+        <select id="logOk" onchange="loadLogs()">
+          <option value="">成功/失败</option>
+          <option value="true">仅成功</option>
+          <option value="false">仅失败</option>
+        </select>
+        <input id="logUser" placeholder="用户 Key ID" style="width:120px" onkeydown="if(event.key==='Enter')loadLogs()"/>
+        <input id="logUp" placeholder="上游 ID" style="width:100px" onkeydown="if(event.key==='Enter')loadLogs()"/>
+        <input id="logQ" placeholder="搜错误 / 模型 / request id" style="min-width:220px" onkeydown="if(event.key==='Enter')loadLogs()"/>
+        <button class="ghost" onclick="loadLogs()">筛选</button>
+      </div>
+      <div class="card"><table id="logTable"></table></div>
+      <p class="muted" id="logMeta"></p>
+    </section>
+    <section id="play" class="hidden">
+      <div class="split">
+        <div class="card">
+          <div class="k">请求体 · POST /v1/systemone</div>
+          <label>模型</label>
+          <select id="playModel">
+            <option>jev-latest</option>
+            <option>jev-preview</option>
+            <option>jev-1.13.0</option>
+          </select>
+          <label>state</label>
+          <textarea id="playState">Stripe linking has failed for days.</textarea>
+          <label>questions JSON</label>
+          <textarea id="playQ">{
+  "urgent": {"type": "noul", "instructions": "The note signals time pressure"}
+}</textarea>
+          <div class="toolbar" style="margin-top:12px">
+            <button onclick="runPlay()">用上游池试一次</button>
+            <button class="ghost" onclick="fillPlay()">填默认</button>
+          </div>
+          <p class="muted">走管理接口，不消耗用户 Key 配额。仍会计入调用日志（user_key_id=0）。</p>
+        </div>
+        <div class="card">
+          <div class="k">响应</div>
+          <p id="playMeta" class="muted">还没跑</p>
+          <pre id="playOut"></pre>
+        </div>
+      </div>
+    </section>
+    <p class="msg" id="err"></p>
+  </div>
+</main>
+<dialog id="upDlg">
+  <form method="dialog" onsubmit="return false">
+    <h3 style="margin:0 0 8px">导入 TypeSafe Key</h3>
+    <label>名称</label><input id="upName" placeholder="prod-1"/>
+    <label>API Key（jev_ / ts_ / apikey_）</label><input id="upKey" placeholder="jev_... 或 apikey_..."/>
+    <label>权重</label><input id="upWeight" type="number" value="1"/>
+    <label>RPM 上限</label><input id="upRpm" type="number" value="1000"/>
+    <div class="toolbar" style="margin-top:12px">
+      <button onclick="saveUp()">保存</button>
+      <button class="ghost" onclick="document.getElementById('upDlg').close()">取消</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="importDlg">
+  <form method="dialog" onsubmit="return false">
+    <h3 style="margin:0 0 8px">批量导入</h3>
+    <p class="muted">每行一条。支持空格、逗号，或 <code>----</code> 分隔。名称可以是邮箱；只导入 <code>jev_</code> / <code>ts_</code> / <code>apikey_</code>。<code>key_</code> 和 <code>auto</code> 会忽略。</p>
+    <textarea id="importText" placeholder="prod-1 jev_xxxx&#10;user@example.com----apikey_xxxx----key_yyyy----auto"></textarea>
+    <div class="split">
+      <div><label>权重</label><input id="importWeight" type="number" value="1"/></div>
+      <div><label>RPM 上限</label><input id="importRpm" type="number" value="1000"/></div>
+    </div>
+    <div class="toolbar" style="margin-top:12px">
+      <button onclick="saveImport()">导入</button>
+      <button class="ghost" onclick="document.getElementById('importDlg').close()">取消</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="keyDlg">
+  <form method="dialog" onsubmit="return false">
+    <h3 style="margin:0 0 8px">签发用户 Key</h3>
+    <label>名称</label><input id="keyName" placeholder="alice / sdk-prod"/>
+    <label>备注</label><input id="keyNote" placeholder="发给谁、用在哪"/>
+    <div class="split">
+      <div><label>RPM</label><input id="keyRpm" type="number" value="60"/></div>
+      <div><label>token 配额（0=不限）</label><input id="keyQuota" type="number" value="0"/></div>
+    </div>
+    <div class="toolbar" style="margin-top:12px">
+      <button onclick="saveKey()">签发</button>
+      <button class="ghost" onclick="document.getElementById('keyDlg').close()">取消</button>
+    </div>
+  </form>
+</dialog>
+<script>
+const $ = id => document.getElementById(id);
+$('token').value = localStorage.getItem('jev_admin') || '';
+$('token').addEventListener('keydown', e => { if (e.key === 'Enter') saveToken(); });
+
+function token(){ return (localStorage.getItem('jev_admin') || '').trim(); }
+function headers(){ return { 'Content-Type':'application/json', 'X-Admin-Token': token() }; }
+function tab(btn){
+  document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  ['upstreams','keys','logs','play'].forEach(id => $(id).classList.toggle('hidden', id!==btn.dataset.tab));
+}
+function ts(ms){ if(!ms) return '-'; return new Date(ms).toLocaleString(); }
+function err(e){ $('err').textContent = e||''; }
+function showApp(on){
+  $('gate').classList.toggle('hidden', on);
+  $('app').classList.toggle('hidden', !on);
+  $('headerAuth').classList.toggle('hidden', !on);
+  $('authState').textContent = on ? '已登录' : '未登录';
+}
+async function api(path, opt={}){
+  const r = await fetch('/admin/api'+path, { ...opt, headers: headers() });
+  const t = await r.text();
+  let j=null; try{ j=JSON.parse(t) }catch{}
+  if(!r.ok) throw new Error((j&&j.error&&j.error.message)||t||r.status);
+  return j;
+}
+async function saveToken(){
+  const v = $('token').value.trim();
+  $('gateErr').textContent = '';
+  if(!v){ $('gateErr').textContent = '口令不能为空。先 cat data/admin.token'; return; }
+  localStorage.setItem('jev_admin', v);
+  try{
+    await api('/stats');
+    showApp(true);
+    await loadAll();
+  }catch(e){
+    localStorage.removeItem('jev_admin');
+    showApp(false);
+    $('gateErr').textContent = '口令不对。在运行 jevproxy 的目录执行：\ncat data/admin.token\n把输出整行贴进来。不要贴 jev_ 开头的 TypeSafe Key。';
+  }
+}
+function logout(){
+  localStorage.removeItem('jev_admin');
+  $('token').value = '';
+  showApp(false);
+}
+function n(v){ return Number(v||0).toLocaleString(); }
+function spark(hourly){
+  const pts = hourly||[];
+  if(!pts.length) return '';
+  const max = Math.max(1, ...pts.map(p=>p.req||0));
+  return '<div class="bars">'+pts.map(p=>{
+    const h = Math.max(2, Math.round(64*(p.req||0)/max));
+    const cls = (p.ok||0) === (p.req||0) ? 'ok' : '';
+    return '<i class="'+cls+'" style="height:'+h+'px" title="'+ts(p.t)+'  '+p.req+' req"></i>';
+  }).join('')+'</div>';
+}
+async function loadAll(){
+  err('');
+  try{
+    const s = await api('/stats');
+    $('stats').innerHTML = [
+      ['上游', s.upstreams_live+' / '+s.upstreams, (s.upstreams_cool? s.upstreams_cool+' 冷却中':'可用')],
+      ['用户 Key', s.user_keys_live+' / '+s.user_keys, ''],
+      ['24h 请求', n(s.ok_24h)+' / '+n(s.req_24h), (s.fail_24h||0)+' 失败'],
+      ['24h tokens', n(s.tokens_24h), 'p50 '+(s.latency_p50||0)+'ms · p95 '+(s.latency_p95||0)+'ms'],
+    ].map(([k,v,sub])=>'<div class="card"><div class="k">'+k+'</div><div class="v">'+v+'</div><div class="sub">'+esc(sub)+'</div></div>').join('')
+      + '<div class="card" style="grid-column:1/-1"><div class="k">24h 按小时</div>'+spark(s.hourly)+'</div>';
+    const u = await api('/upstreams');
+    const now = Date.now();
+    $('upTable').innerHTML = '<tr><th>ID</th><th>名称</th><th>Key</th><th>权重/RPM</th><th>状态</th><th>失败</th><th>最近</th><th></th></tr>' +
+      (u.items||[]).map(x=>{
+        const cool = x.cooldown_until > now ? '<div class="warn">冷却至 '+ts(x.cooldown_until)+'</div>' : '';
+        return '<tr>'+
+        '<td>'+x.id+'</td><td>'+esc(x.name)+'</td><td>'+esc(x.mask)+'</td>'+
+        '<td>'+x.weight+' / '+x.rpm_limit+'</td>'+
+        '<td class="'+(x.status==='active'?'ok':'bad')+'">'+x.status+cool+'</td>'+
+        '<td>'+x.fail_count+(x.last_err?'<div class="muted">'+esc(x.last_err)+'</div>':'')+'</td>'+
+        '<td>ok '+ts(x.last_ok_at)+'<br/>err '+ts(x.last_err_at)+'</td>'+
+        '<td>'+
+          '<button class="ghost" onclick="probe('+x.id+')">探活</button> '+
+          '<button class="ghost" onclick="toggleUp('+x.id+',\''+x.status+'\')">'+(x.status==='active'?'停用':'启用')+'</button> '+
+          '<button class="danger" onclick="delUp('+x.id+')">删除</button>'+
+        '</td></tr>';
+      }).join('');
+    const k = await api('/keys');
+    window._keys = k.items||[];
+    $('keyTable').innerHTML = '<tr><th>ID</th><th>名称</th><th>Key</th><th>RPM</th><th>配额</th><th>已用</th><th>备注</th><th>状态</th><th></th></tr>' +
+      (k.items||[]).map(x=>'<tr>'+
+        '<td>'+x.id+'</td><td>'+esc(x.name)+'</td><td>'+esc(x.mask)+'</td>'+
+        '<td>'+x.rpm_limit+'</td><td>'+(x.token_quota||'∞')+'</td><td>'+x.tokens_used+'</td>'+
+        '<td class="muted">'+esc(x.note||'')+'</td>'+
+        '<td class="'+(x.status==='active'?'ok':'bad')+'">'+x.status+'</td>'+
+        '<td>'+
+          '<button class="ghost" onclick="toggleKey('+x.id+',\''+x.status+'\')">'+(x.status==='active'?'停用':'启用')+'</button> '+
+          '<button class="ghost" onclick="editNote('+x.id+')">备注</button> '+
+          '<button class="ghost" onclick="resetKey('+x.id+')">清零用量</button> '+
+          '<button class="danger" onclick="delKey('+x.id+')">删除</button>'+
+        '</td></tr>').join('');
+    await loadLogs();
+  }catch(e){ err(e.message); }
+}
+async function loadLogs(){
+  const qs = new URLSearchParams();
+  qs.set('limit','80');
+  const range = $('logRange').value; if(range) qs.set('range', range);
+  const ok = $('logOk').value; if(ok) qs.set('ok', ok);
+  const uid = $('logUser').value.trim(); if(uid) qs.set('user_key_id', uid);
+  const up = $('logUp').value.trim(); if(up) qs.set('upstream_id', up);
+  const q = $('logQ').value.trim(); if(q) qs.set('q', q);
+  const l = await api('/logs?'+qs.toString());
+  $('logMeta').textContent = '共 '+(l.total||0)+' 条';
+  $('logTable').innerHTML = '<tr><th>时间</th><th>用户</th><th>上游</th><th>模型</th><th>tokens</th><th>ms</th><th>状态</th><th>错误 / rid</th></tr>' +
+    (l.items||[]).map(x=>'<tr>'+
+      '<td>'+ts(x.created_at)+'</td>'+
+      '<td>'+x.user_key_id+'</td>'+
+      '<td>'+(x.upstream_id||'-')+'</td>'+
+      '<td>'+esc(x.model||'')+'</td>'+
+      '<td>'+(x.input_tokens||0)+'</td>'+
+      '<td>'+(x.latency_ms||0)+'</td>'+
+      '<td class="'+(x.ok?'ok':'bad')+'">'+x.status_code+'</td>'+
+      '<td class="muted">'+esc(x.error||'')+(x.request_id?'<div>'+esc(x.request_id)+'</div>':'')+'</td></tr>').join('');
+}
+function openUp(){ $('upName').value=''; $('upKey').value=''; $('upDlg').showModal(); }
+function openImport(){ $('importText').value=''; $('importDlg').showModal(); }
+function openKey(){ $('keyName').value=''; $('keyNote').value=''; $('keyDlg').showModal(); }
+async function saveUp(){
+  try{
+    await api('/upstreams',{method:'POST', body: JSON.stringify({
+      name:$('upName').value, api_key:$('upKey').value,
+      weight:Number($('upWeight').value||1), rpm_limit:Number($('upRpm').value||1000)
+    })});
+    $('upDlg').close(); loadAll();
+  }catch(e){ err(e.message); }
+}
+async function saveImport(){
+  try{
+    const r = await api('/upstreams/import',{method:'POST', body: JSON.stringify({
+      text:$('importText').value,
+      weight:Number($('importWeight').value||1),
+      rpm_limit:Number($('importRpm').value||1000)
+    })});
+    $('importDlg').close();
+    err('导入 '+r.created+' 条'+(r.skipped? '，跳过重复 '+r.skipped:'')+'。');
+    loadAll();
+  }catch(e){ err(e.message); }
+}
+async function delUp(id){ if(!confirm('删除上游 '+id+'?'))return; await api('/upstreams/'+id,{method:'DELETE'}); loadAll(); }
+async function toggleUp(id, st){ await api('/upstreams/'+id,{method:'PUT', body: JSON.stringify({status: st==='active'?'disabled':'active'})}); loadAll(); }
+async function probe(id){ try{ const r=await api('/upstreams/'+id+'/probe',{method:'POST'}); alert((r.ok?'OK ':'FAIL ')+r.status_code+'\n'+(r.error||r.body||'')); loadAll(); }catch(e){ err(e.message);} }
+async function probeAll(){
+  try{
+    const r = await api('/upstreams/probe-all',{method:'POST'});
+    alert('探活完成：'+r.ok+' / '+r.total+' 可用');
+    loadAll();
+  }catch(e){ err(e.message); }
+}
+async function saveKey(){
+  try{
+    const r = await api('/keys',{method:'POST', body: JSON.stringify({
+      name:$('keyName').value, note:$('keyNote').value,
+      rpm_limit:Number($('keyRpm').value||60), token_quota:Number($('keyQuota').value||0)
+    })});
+    $('keyDlg').close();
+    $('newPlain').innerHTML = '<div class="plain"><b>只显示一次，立刻复制：</b><br/>'+esc(r.plain)+'</div>';
+    loadAll();
+  }catch(e){ err(e.message); }
+}
+async function delKey(id){ if(!confirm('删除用户 Key '+id+'?'))return; await api('/keys/'+id,{method:'DELETE'}); loadAll(); }
+async function toggleKey(id, st){ await api('/keys/'+id,{method:'PUT', body: JSON.stringify({status: st==='active'?'disabled':'active'})}); loadAll(); }
+async function resetKey(id){ await api('/keys/'+id+'/reset-usage',{method:'POST'}); loadAll(); }
+async function editNote(id){
+  const cur = (window._keys||[]).find(x=>x.id===id);
+  const note = prompt('备注', (cur && cur.note) || '');
+  if(note===null) return;
+  await api('/keys/'+id,{method:'PUT', body: JSON.stringify({note})});
+  loadAll();
+}
+function fillPlay(){
+  $('playState').value = 'Stripe linking has failed for days.';
+  $('playQ').value = '{\n  "urgent": {"type": "noul", "instructions": "The note signals time pressure"}\n}';
+}
+async function runPlay(){
+  $('playMeta').textContent = '请求中…';
+  $('playOut').textContent = '';
+  let questions;
+  try{ questions = JSON.parse($('playQ').value); }
+  catch(e){ $('playMeta').textContent='questions 不是合法 JSON'; return; }
+  const body = { state:$('playState').value, model:$('playModel').value, questions };
+  try{
+    const r = await api('/playground',{method:'POST', body: JSON.stringify(body)});
+    $('playMeta').textContent = (r.ok?'OK ':'FAIL ')+r.status_code+' · '+r.latency_ms+'ms · tokens '+r.input_tokens+(r.model?' · '+r.model:'');
+    $('playOut').textContent = JSON.stringify(r.body || r, null, 2);
+    loadLogs();
+  }catch(e){
+    $('playMeta').textContent = '失败';
+    $('playOut').textContent = e.message;
+  }
+}
+function esc(s){ return String(s||'').replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+if(token()) saveToken();
+</script>
+</body>
+</html>

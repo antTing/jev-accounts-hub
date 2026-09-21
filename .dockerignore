@@ -1,0 +1,11 @@
+data
+.git
+.claude
+jevproxy
+*.db
+*.db-wal
+*.db-shm
+.env
+.DS_Store
+*.token
+*.key
