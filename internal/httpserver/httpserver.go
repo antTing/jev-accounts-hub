@@ -86,6 +86,12 @@ func (s *Server) Handler() http.Handler {
 	admin.POST("/keys/:id/reset-usage", s.adminResetKeyUsage)
 	admin.GET("/logs", s.adminLogs)
 	admin.POST("/playground", s.adminPlayground)
+	admin.GET("/proxies", s.adminListProxies)
+	admin.POST("/proxies", s.adminCreateProxy)
+	admin.POST("/proxies/import", s.adminImportProxies)
+	admin.PUT("/proxies/:id", s.adminUpdateProxy)
+	admin.DELETE("/proxies/:id", s.adminDeleteProxy)
+	admin.POST("/proxies/:id/probe", s.adminProbeProxy)
 
 	r.GET("/", func(c *gin.Context) {
 		c.Header("Content-Type", "text/html; charset=utf-8")
@@ -206,6 +212,7 @@ type upstreamDTO struct {
 	LastErrAt     *int64 `json:"last_err_at"`
 	LastErr       string `json:"last_err"`
 	CreatedAt     int64  `json:"created_at"`
+	ProxyID       *int64 `json:"proxy_id"`
 }
 
 func toUpstreamDTO(u store.Upstream) upstreamDTO {
@@ -213,6 +220,7 @@ func toUpstreamDTO(u store.Upstream) upstreamDTO {
 		ID: u.ID, Name: u.Name, Mask: u.Mask(), Weight: u.Weight, RPMLimit: u.RPMLimit,
 		Status: u.Status, FailCount: u.FailCount, CooldownUntil: u.CooldownUntil,
 		LastOKAt: u.LastOKAt, LastErrAt: u.LastErrAt, LastErr: u.LastErr, CreatedAt: u.CreatedAt,
+		ProxyID: u.ProxyID,
 	}
 }
 
@@ -230,11 +238,12 @@ func (s *Server) adminListUpstreams(c *gin.Context) {
 }
 
 type upstreamReq struct {
-	Name     string `json:"name"`
-	APIKey   string `json:"api_key"`
-	Weight   *int   `json:"weight"`
-	RPMLimit *int   `json:"rpm_limit"`
-	Status   string `json:"status"`
+	Name     string        `json:"name"`
+	APIKey   string        `json:"api_key"`
+	Weight   *int          `json:"weight"`
+	RPMLimit *int          `json:"rpm_limit"`
+	Status   string        `json:"status"`
+	ProxyID  optionalInt64 `json:"proxy_id"`
 }
 
 func (s *Server) adminCreateUpstream(c *gin.Context) {
@@ -259,7 +268,11 @@ func (s *Server) adminCreateUpstream(c *gin.Context) {
 	if req.RPMLimit != nil {
 		rpm = *req.RPMLimit
 	}
-	u, err := s.insertUpstream(c.Request.Context(), strings.TrimSpace(req.Name), key, weight, rpm, req.Status)
+	proxyID, err := s.validatedProxyID(c, req.ProxyID)
+	if err != nil {
+		return
+	}
+	u, err := s.insertUpstream(c.Request.Context(), strings.TrimSpace(req.Name), key, weight, rpm, req.Status, proxyID)
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			s.fail(c, 409, "upstream key already imported")
@@ -271,7 +284,7 @@ func (s *Server) adminCreateUpstream(c *gin.Context) {
 	c.JSON(201, toUpstreamDTO(u))
 }
 
-func (s *Server) insertUpstream(ctx context.Context, name, key string, weight, rpm int, status string) (store.Upstream, error) {
+func (s *Server) insertUpstream(ctx context.Context, name, key string, weight, rpm int, status string, proxyID *int64) (store.Upstream, error) {
 	hash := cryptox.HashAPIKey(key)
 	exists, err := s.store.UpstreamHashExists(ctx, hash)
 	if err != nil {
@@ -290,7 +303,7 @@ func (s *Server) insertUpstream(ctx context.Context, name, key string, weight, r
 	}
 	id, err := s.store.InsertUpstream(ctx, store.Upstream{
 		Name: name, KeyEnc: enc, KeyPrefix: prefix, KeyLast4: last4, KeyHash: hash,
-		Weight: weight, RPMLimit: rpm, Status: status,
+		Weight: weight, RPMLimit: rpm, Status: status, ProxyID: proxyID,
 	})
 	if err != nil {
 		return store.Upstream{}, err
@@ -348,7 +361,17 @@ func (s *Server) adminUpdateUpstream(c *gin.Context) {
 		prefix, last4 = store.PrefixLast4(k)
 		hash = cryptox.HashAPIKey(k)
 	}
-	if err := s.store.UpdateUpstream(c.Request.Context(), id, name, weight, rpm, status, enc, prefix, last4, hash); err != nil {
+	var proxyID *int64
+	setProxy := false
+	if req.ProxyID.set {
+		pid, err := s.validatedProxyID(c, req.ProxyID)
+		if err != nil {
+			return
+		}
+		proxyID = pid
+		setProxy = true
+	}
+	if err := s.store.UpdateUpstream(c.Request.Context(), id, name, weight, rpm, status, enc, prefix, last4, hash, proxyID, setProxy); err != nil {
 		s.fail(c, 500, err.Error())
 		return
 	}
@@ -395,7 +418,7 @@ func (s *Server) adminProbeUpstream(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 12*time.Second)
 	defer cancel()
-	status, body, ferr := s.gw.Probe(ctx, key)
+	status, body, ferr := s.gw.Probe(ctx, u, key)
 	ok := ferr == nil && status >= 200 && status < 300
 	if ok {
 		s.pool.MarkOK(c.Request.Context(), id)
@@ -642,7 +665,7 @@ func (s *Server) adminImportUpstreams(c *gin.Context) {
 	created, skipped := 0, 0
 	var items []upstreamDTO
 	for _, ln := range lines {
-		u, err := s.insertUpstream(c.Request.Context(), ln.name, ln.key, req.Weight, req.RPMLimit, "active")
+		u, err := s.insertUpstream(c.Request.Context(), ln.name, ln.key, req.Weight, req.RPMLimit, "active", nil)
 		if err != nil {
 			if errors.Is(err, store.ErrConflict) {
 				skipped++
@@ -681,7 +704,7 @@ func (s *Server) adminProbeAll(c *gin.Context) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 12*time.Second)
-		status, body, ferr := s.gw.Probe(ctx, key)
+		status, body, ferr := s.gw.Probe(ctx, u, key)
 		cancel()
 		ok := ferr == nil && status >= 200 && status < 300
 		item := probeOne{ID: u.ID, OK: ok, StatusCode: status}
@@ -811,6 +834,29 @@ func looksLikeUpstreamKey(s string) bool {
 	default:
 		return false
 	}
+}
+
+func (s *Server) validatedProxyID(c *gin.Context, opt optionalInt64) (*int64, error) {
+	if !opt.set {
+		return nil, nil
+	}
+	if opt.val == nil {
+		return nil, nil
+	}
+	id := *opt.val
+	if id == 0 {
+		z := int64(0)
+		return &z, nil
+	}
+	if _, err := s.store.GetProxy(c.Request.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.fail(c, 400, "proxy not found")
+			return nil, err
+		}
+		s.fail(c, 500, err.Error())
+		return nil, err
+	}
+	return &id, nil
 }
 
 func (s *Server) fail(c *gin.Context, code int, msg string) {

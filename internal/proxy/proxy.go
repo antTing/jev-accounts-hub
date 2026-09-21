@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"jevproxy/internal/cryptox"
+	"jevproxy/internal/outproxy"
 	"jevproxy/internal/pool"
 	"jevproxy/internal/ratelimit"
 	"jevproxy/internal/store"
@@ -26,6 +27,8 @@ type Gateway struct {
 	Store    *store.Store
 	Pool     *pool.Pool
 	Limit    *ratelimit.Limiter
+	Picker   *outproxy.Picker
+	Clients  *outproxy.Clients
 	Upstream string
 	Timeout  time.Duration
 	Client   *http.Client
@@ -40,21 +43,17 @@ func New(st *store.Store, p *pool.Pool, lim *ratelimit.Limiter, upstream string,
 	if timeout < time.Second {
 		timeout = 15 * time.Second
 	}
+	direct, _ := outproxy.NewClient(timeout, nil)
 	return &Gateway{
 		Store:    st,
 		Pool:     p,
 		Limit:    lim,
+		Picker:   outproxy.NewPicker(st),
+		Clients:  outproxy.NewClients(timeout),
 		Upstream: strings.TrimRight(upstream, "/"),
 		Timeout:  timeout,
-		Client: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        64,
-				MaxIdleConnsPerHost: 16,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
-		Log: log,
+		Client:   direct,
+		Log:      log,
 	}
 }
 
@@ -142,6 +141,7 @@ func (g *Gateway) Evaluate(ctx context.Context, user *store.UserKey, body []byte
 	}
 
 	exclude := map[int64]struct{}{}
+	proxyExclude := map[int64]struct{}{}
 	var last httpErr
 	attempts := 3
 	for i := 0; i < attempts; i++ {
@@ -162,9 +162,20 @@ func (g *Gateway) Evaluate(ctx context.Context, user *store.UserKey, body []byte
 			continue
 		}
 
-		status, respBody, hdr, lat, ferr := g.forward(ctx, http.MethodPost, "/v1/systemone", body, sel.APIKey, requestID)
+		choice, perr := g.pickExit(ctx, sel.Up, proxyExclude)
+		if perr != nil {
+			exclude[sel.Up.ID] = struct{}{}
+			last = errHTTP(502, "proxy_error", perr.Error())
+			g.Log.Warn("proxy pick failed", "upstream_id", sel.Up.ID, "err", perr, "attempt", i+1)
+			continue
+		}
+		status, respBody, hdr, lat, ferr := g.forward(ctx, http.MethodPost, "/v1/systemone", body, sel.APIKey, requestID, choice.Proxy)
 		upID := sel.Up.ID
 		if ferr != nil {
+			g.markProxyTransportErr(ctx, choice, ferr)
+			if choice.Proxy != nil {
+				proxyExclude[choice.Proxy.ID] = struct{}{}
+			}
 			g.Pool.MarkErr(ctx, upID, ferr.Error(), 0)
 			exclude[upID] = struct{}{}
 			last = errHTTP(502, "upstream_error", ferr.Error())
@@ -172,6 +183,7 @@ func (g *Gateway) Evaluate(ctx context.Context, user *store.UserKey, body []byte
 			continue
 		}
 
+		g.markProxyOK(ctx, choice, lat)
 		retryable := status == 429 || status == 529 || status >= 500
 		authFail := status == 401 || status == 403
 		if retryable || authFail {
@@ -259,6 +271,7 @@ func (g *Gateway) Models(w http.ResponseWriter, r *http.Request, user store.User
 	}
 
 	exclude := map[int64]struct{}{}
+	proxyExclude := map[int64]struct{}{}
 	for i := 0; i < 3; i++ {
 		sel, err := g.Pool.Pick(r.Context(), exclude)
 		if err != nil {
@@ -269,14 +282,24 @@ func (g *Gateway) Models(w http.ResponseWriter, r *http.Request, user store.User
 			writeErr(w, errHTTP(500, "internal_error", err.Error()))
 			return
 		}
-		status, respBody, hdr, lat, ferr := g.forward(r.Context(), http.MethodGet, "/v1/models", nil, sel.APIKey, requestID)
+		choice, perr := g.pickExit(r.Context(), sel.Up, proxyExclude)
+		if perr != nil {
+			exclude[sel.Up.ID] = struct{}{}
+			continue
+		}
+		status, respBody, hdr, lat, ferr := g.forward(r.Context(), http.MethodGet, "/v1/models", nil, sel.APIKey, requestID, choice.Proxy)
 		upID := sel.Up.ID
 		if ferr != nil || status == 429 || status == 529 || status >= 500 || status == 401 || status == 403 {
 			msg := ""
 			if ferr != nil {
 				msg = ferr.Error()
+				g.markProxyTransportErr(r.Context(), choice, ferr)
+				if choice.Proxy != nil {
+					proxyExclude[choice.Proxy.ID] = struct{}{}
+				}
 			} else {
 				msg = snippet(respBody)
+				g.markProxyOK(r.Context(), choice, lat)
 			}
 			code := status
 			if ferr != nil {
@@ -286,6 +309,7 @@ func (g *Gateway) Models(w http.ResponseWriter, r *http.Request, user store.User
 			exclude[upID] = struct{}{}
 			continue
 		}
+		g.markProxyOK(r.Context(), choice, lat)
 		g.Pool.MarkOK(r.Context(), upID)
 		_ = g.Store.InsertLog(r.Context(), store.UsageLog{
 			UserKeyID:  user.ID,
@@ -338,13 +362,55 @@ func looksLikeModelCatalog(body []byte) bool {
 	return ok
 }
 
-func (g *Gateway) Probe(ctx context.Context, apiKey string) (int, []byte, error) {
+func (g *Gateway) Probe(ctx context.Context, up store.Upstream, apiKey string) (int, []byte, error) {
 	body := []byte(`{"state":"ping","model":"jev-latest","questions":{"ok":{"type":"noul","instructions":"This is a connectivity probe"}}}`)
-	status, resp, _, _, err := g.forward(ctx, http.MethodPost, "/v1/systemone", body, apiKey, "probe")
-	return status, resp, err
+	choice, err := g.pickExit(ctx, up, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	status, resp, _, lat, ferr := g.forward(ctx, http.MethodPost, "/v1/systemone", body, apiKey, "probe", choice.Proxy)
+	if ferr != nil {
+		g.markProxyTransportErr(ctx, choice, ferr)
+		return status, resp, ferr
+	}
+	if status >= 200 && status < 300 {
+		g.markProxyOK(ctx, choice, lat)
+	}
+	return status, resp, ferr
 }
 
-func (g *Gateway) forward(ctx context.Context, method, path string, body []byte, apiKey, requestID string) (int, []byte, http.Header, int64, error) {
+func (g *Gateway) pickExit(ctx context.Context, up store.Upstream, exclude map[int64]struct{}) (outproxy.Choice, error) {
+	if g.Picker == nil {
+		return outproxy.Choice{Direct: true}, nil
+	}
+	return g.Picker.Pick(ctx, up, exclude)
+}
+
+func (g *Gateway) markProxyTransportErr(ctx context.Context, choice outproxy.Choice, err error) {
+	if choice.Proxy == nil || g.Store == nil {
+		return
+	}
+	_ = g.Store.TouchProxyErr(ctx, choice.Proxy.ID, err.Error(), outproxy.CooldownMS())
+}
+
+func (g *Gateway) markProxyOK(ctx context.Context, choice outproxy.Choice, lat int64) {
+	if choice.Proxy == nil || g.Store == nil {
+		return
+	}
+	_ = g.Store.TouchProxyOK(ctx, choice.Proxy.ID, "", "", lat)
+}
+
+func (g *Gateway) clientFor(via *store.Proxy) (*http.Client, error) {
+	if g.Clients != nil {
+		return g.Clients.Get(via)
+	}
+	if via == nil {
+		return g.Client, nil
+	}
+	return outproxy.NewClient(g.Timeout, via)
+}
+
+func (g *Gateway) forward(ctx context.Context, method, path string, body []byte, apiKey, requestID string, via *store.Proxy) (int, []byte, http.Header, int64, error) {
 	start := time.Now()
 	var rdr io.Reader
 	if body != nil {
@@ -362,7 +428,11 @@ func (g *Gateway) forward(ctx context.Context, method, path string, body []byte,
 	if requestID != "" {
 		req.Header.Set("X-Request-Id", requestID)
 	}
-	resp, err := g.Client.Do(req)
+	cli, err := g.clientFor(via)
+	if err != nil {
+		return 0, nil, nil, 0, err
+	}
+	resp, err := cli.Do(req)
 	lat := time.Since(start).Milliseconds()
 	if err != nil {
 		return 0, nil, nil, lat, err

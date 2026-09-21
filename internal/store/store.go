@@ -96,6 +96,29 @@ CREATE TABLE IF NOT EXISTS usage_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_logs(user_key_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS proxies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  protocol TEXT NOT NULL,
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  username TEXT NOT NULL DEFAULT '',
+  password TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  cooldown_until INTEGER NOT NULL DEFAULT 0,
+  last_ok_at INTEGER,
+  last_err_at INTEGER,
+  last_err TEXT,
+  last_ip TEXT NOT NULL DEFAULT '',
+  last_country TEXT NOT NULL DEFAULT '',
+  last_latency_ms INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_endpoint ON proxies(protocol, host, port, username, password);
+CREATE INDEX IF NOT EXISTS idx_proxy_status ON proxies(status);
 `)
 	if err != nil {
 		return err
@@ -108,6 +131,9 @@ func (s *Store) ensureColumns() error {
 		return err
 	}
 	if err := s.addColumnIfMissing("upstream_keys", "key_hash", `ALTER TABLE upstream_keys ADD COLUMN key_hash TEXT`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("upstream_keys", "proxy_id", `ALTER TABLE upstream_keys ADD COLUMN proxy_id INTEGER`); err != nil {
 		return err
 	}
 	_, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_upstream_key_hash ON upstream_keys(key_hash) WHERE key_hash IS NOT NULL AND key_hash != ''`)
@@ -130,6 +156,11 @@ func (s *Store) addColumnIfMissing(table, col, ddl string) error {
 
 func nowMS() int64 { return time.Now().UnixMilli() }
 
+// ProxyID 语义：
+//
+//	nil = 走共享代理池（池空则直连）
+//	0   = 强制直连
+//	N   = 固定绑定代理 N
 type Upstream struct {
 	ID            int64
 	Name          string
@@ -147,6 +178,29 @@ type Upstream struct {
 	CreatedAt     int64
 	UpdatedAt     int64
 	KeyHash       string
+	ProxyID       *int64
+}
+
+type Proxy struct {
+	ID            int64
+	Name          string
+	Protocol      string
+	Host          string
+	Port          int
+	Username      string
+	Password      string
+	Status        string
+	FailCount     int
+	CooldownUntil int64
+	LastOKAt      *int64
+	LastErrAt     *int64
+	LastErr       string
+	LastIP        string
+	LastCountry   string
+	LastLatencyMS int64
+	CreatedAt     int64
+	UpdatedAt     int64
+	BoundCount    int64
 }
 
 func (u Upstream) Mask() string {
@@ -203,8 +257,10 @@ type UsageLog struct {
 	CreatedAt    int64  `json:"created_at"`
 }
 
+const upstreamCols = `id,name,key_enc,key_prefix,key_last4,weight,rpm_limit,status,fail_count,cooldown_until,last_ok_at,last_err_at,last_err,created_at,updated_at,proxy_id`
+
 func (s *Store) ListUpstreams(ctx context.Context) ([]Upstream, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,key_enc,key_prefix,key_last4,weight,rpm_limit,status,fail_count,cooldown_until,last_ok_at,last_err_at,last_err,created_at,updated_at FROM upstream_keys ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+upstreamCols+` FROM upstream_keys ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +277,7 @@ func (s *Store) ListUpstreams(ctx context.Context) ([]Upstream, error) {
 }
 
 func (s *Store) GetUpstream(ctx context.Context, id int64) (Upstream, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id,name,key_enc,key_prefix,key_last4,weight,rpm_limit,status,fail_count,cooldown_until,last_ok_at,last_err_at,last_err,created_at,updated_at FROM upstream_keys WHERE id=?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT `+upstreamCols+` FROM upstream_keys WHERE id=?`, id)
 	u, err := scanUpstream(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Upstream{}, ErrNotFound
@@ -235,8 +291,8 @@ func (s *Store) InsertUpstream(ctx context.Context, u Upstream) (int64, error) {
 	if h := strings.TrimSpace(u.KeyHash); h != "" {
 		hash = h
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO upstream_keys(name,key_enc,key_prefix,key_last4,weight,rpm_limit,status,fail_count,cooldown_until,created_at,updated_at,key_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		u.Name, u.KeyEnc, u.KeyPrefix, u.KeyLast4, nz(u.Weight, 1), nz(u.RPMLimit, 1000), nstr(u.Status, "active"), 0, 0, now, now, hash)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO upstream_keys(name,key_enc,key_prefix,key_last4,weight,rpm_limit,status,fail_count,cooldown_until,created_at,updated_at,key_hash,proxy_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		u.Name, u.KeyEnc, u.KeyPrefix, u.KeyLast4, nz(u.Weight, 1), nz(u.RPMLimit, 1000), nstr(u.Status, "active"), 0, 0, now, now, hash, nullInt(u.ProxyID))
 	if err != nil {
 		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
 			return 0, ErrConflict
@@ -255,7 +311,7 @@ func (s *Store) UpstreamHashExists(ctx context.Context, hash string) (bool, erro
 	return n > 0, err
 }
 
-func (s *Store) UpdateUpstream(ctx context.Context, id int64, name string, weight, rpm int, status string, keyEnc []byte, prefix, last4, keyHash string) error {
+func (s *Store) UpdateUpstream(ctx context.Context, id int64, name string, weight, rpm int, status string, keyEnc []byte, prefix, last4, keyHash string, proxyID *int64, setProxy bool) error {
 	now := nowMS()
 	var res sql.Result
 	var err error
@@ -264,8 +320,16 @@ func (s *Store) UpdateUpstream(ctx context.Context, id int64, name string, weigh
 		if h := strings.TrimSpace(keyHash); h != "" {
 			hash = h
 		}
-		res, err = s.db.ExecContext(ctx, `UPDATE upstream_keys SET name=?, weight=?, rpm_limit=?, status=?, key_enc=?, key_prefix=?, key_last4=?, key_hash=?, updated_at=? WHERE id=?`,
-			name, nz(weight, 1), nz(rpm, 1000), nstr(status, "active"), keyEnc, prefix, last4, hash, now, id)
+		if setProxy {
+			res, err = s.db.ExecContext(ctx, `UPDATE upstream_keys SET name=?, weight=?, rpm_limit=?, status=?, key_enc=?, key_prefix=?, key_last4=?, key_hash=?, proxy_id=?, updated_at=? WHERE id=?`,
+				name, nz(weight, 1), nz(rpm, 1000), nstr(status, "active"), keyEnc, prefix, last4, hash, nullInt(proxyID), now, id)
+		} else {
+			res, err = s.db.ExecContext(ctx, `UPDATE upstream_keys SET name=?, weight=?, rpm_limit=?, status=?, key_enc=?, key_prefix=?, key_last4=?, key_hash=?, updated_at=? WHERE id=?`,
+				name, nz(weight, 1), nz(rpm, 1000), nstr(status, "active"), keyEnc, prefix, last4, hash, now, id)
+		}
+	} else if setProxy {
+		res, err = s.db.ExecContext(ctx, `UPDATE upstream_keys SET name=?, weight=?, rpm_limit=?, status=?, proxy_id=?, updated_at=? WHERE id=?`,
+			name, nz(weight, 1), nz(rpm, 1000), nstr(status, "active"), nullInt(proxyID), now, id)
 	} else {
 		res, err = s.db.ExecContext(ctx, `UPDATE upstream_keys SET name=?, weight=?, rpm_limit=?, status=?, updated_at=? WHERE id=?`,
 			name, nz(weight, 1), nz(rpm, 1000), nstr(status, "active"), now, id)
@@ -502,19 +566,21 @@ type TopKey struct {
 }
 
 type Stats struct {
-	Upstreams     int64      `json:"upstreams"`
-	UpstreamsLive int64      `json:"upstreams_live"`
-	UpstreamsCool int64      `json:"upstreams_cool"`
-	UserKeys      int64      `json:"user_keys"`
-	UserKeysLive  int64      `json:"user_keys_live"`
-	Req24h        int64      `json:"req_24h"`
-	OK24h         int64      `json:"ok_24h"`
-	Fail24h       int64      `json:"fail_24h"`
-	Tokens24h     int64      `json:"tokens_24h"`
-	ReqTotal      int64      `json:"req_total"`
-	TokensTotal   int64      `json:"tokens_total"`
-	LatencyP50    int64      `json:"latency_p50"`
-	LatencyP95    int64      `json:"latency_p95"`
+	Upstreams     int64       `json:"upstreams"`
+	UpstreamsLive int64       `json:"upstreams_live"`
+	UpstreamsCool int64       `json:"upstreams_cool"`
+	UserKeys      int64       `json:"user_keys"`
+	UserKeysLive  int64       `json:"user_keys_live"`
+	Proxies       int64       `json:"proxies"`
+	ProxiesLive   int64       `json:"proxies_live"`
+	Req24h        int64       `json:"req_24h"`
+	OK24h         int64       `json:"ok_24h"`
+	Fail24h       int64       `json:"fail_24h"`
+	Tokens24h     int64       `json:"tokens_24h"`
+	ReqTotal      int64       `json:"req_total"`
+	TokensTotal   int64       `json:"tokens_total"`
+	LatencyP50    int64       `json:"latency_p50"`
+	LatencyP95    int64       `json:"latency_p95"`
 	Hourly        []HourPoint `json:"hourly"`
 	TopKeys       []TopKey    `json:"top_keys"`
 }
@@ -529,6 +595,8 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM upstream_keys WHERE status='active' AND cooldown_until>?`, now).Scan(&st.UpstreamsCool)
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_keys`).Scan(&st.UserKeys)
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_keys WHERE status='active'`).Scan(&st.UserKeysLive)
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM proxies`).Scan(&st.Proxies)
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM proxies WHERE status='active'`).Scan(&st.ProxiesLive)
 	since := time.Now().Add(-24 * time.Hour).UnixMilli()
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(input_tokens),0) FROM usage_logs WHERE created_at>=?`, since).Scan(&st.Req24h, &st.OK24h, &st.Tokens24h)
 	st.Fail24h = st.Req24h - st.OK24h
@@ -579,11 +647,128 @@ WHERE l.created_at>=? GROUP BY l.user_key_id ORDER BY COUNT(*) DESC LIMIT 5`, si
 	return st, nil
 }
 
+const proxyCols = `id,name,protocol,host,port,username,password,status,fail_count,cooldown_until,last_ok_at,last_err_at,last_err,last_ip,last_country,last_latency_ms,created_at,updated_at`
+
+func (s *Store) ListProxies(ctx context.Context) ([]Proxy, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+proxyCols+`, (SELECT COUNT(*) FROM upstream_keys u WHERE u.proxy_id=p.id) FROM proxies p ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Proxy
+	for rows.Next() {
+		p, err := scanProxy(rows, true)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListActiveProxies(ctx context.Context) ([]Proxy, error) {
+	now := nowMS()
+	rows, err := s.db.QueryContext(ctx, `SELECT `+proxyCols+` FROM proxies WHERE status='active' AND cooldown_until<=? ORDER BY id`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Proxy
+	for rows.Next() {
+		p, err := scanProxy(rows, false)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetProxy(ctx context.Context, id int64) (Proxy, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+proxyCols+`, (SELECT COUNT(*) FROM upstream_keys u WHERE u.proxy_id=p.id) FROM proxies p WHERE p.id=?`, id)
+	p, err := scanProxy(row, true)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Proxy{}, ErrNotFound
+	}
+	return p, err
+}
+
+func (s *Store) InsertProxy(ctx context.Context, p Proxy) (int64, error) {
+	now := nowMS()
+	res, err := s.db.ExecContext(ctx, `INSERT INTO proxies(name,protocol,host,port,username,password,status,fail_count,cooldown_until,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,0,?,?)`,
+		p.Name, p.Protocol, p.Host, p.Port, p.Username, p.Password, nstr(p.Status, "active"), 0, now, now)
+	if err != nil {
+		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
+			return 0, ErrConflict
+		}
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *Store) UpdateProxy(ctx context.Context, id int64, name, protocol, host string, port int, username, password, status string) error {
+	now := nowMS()
+	res, err := s.db.ExecContext(ctx, `UPDATE proxies SET name=?, protocol=?, host=?, port=?, username=?, password=?, status=?, updated_at=? WHERE id=?`,
+		name, protocol, host, port, username, password, nstr(status, "active"), now, id)
+	if err != nil {
+		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
+			return ErrConflict
+		}
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteProxy(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE upstream_keys SET proxy_id=NULL, updated_at=? WHERE proxy_id=?`, nowMS(), id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM proxies WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+func (s *Store) TouchProxyOK(ctx context.Context, id int64, ip, country string, latencyMS int64) error {
+	now := nowMS()
+	_, err := s.db.ExecContext(ctx, `UPDATE proxies SET fail_count=0, cooldown_until=0, last_ok_at=?, last_err='',
+		last_ip=CASE WHEN ?='' THEN last_ip ELSE ? END,
+		last_country=CASE WHEN ?='' THEN last_country ELSE ? END,
+		last_latency_ms=CASE WHEN ?<=0 THEN last_latency_ms ELSE ? END,
+		updated_at=? WHERE id=?`,
+		now, ip, ip, country, country, latencyMS, latencyMS, now, id)
+	return err
+}
+
+func (s *Store) TouchProxyErr(ctx context.Context, id int64, msg string, cooldownMS int64) error {
+	now := nowMS()
+	if len(msg) > 500 {
+		msg = msg[:500]
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE proxies SET fail_count=fail_count+1, cooldown_until=?, last_err_at=?, last_err=?, updated_at=? WHERE id=?`,
+		cooldownMS, now, msg, now, id)
+	return err
+}
+
 func percentile(vals []int64, p int) int64 {
 	if len(vals) == 0 {
 		return 0
 	}
-	idx := (len(vals)-1) * p / 100
+	idx := (len(vals) - 1) * p / 100
 	return vals[idx]
 }
 
@@ -593,9 +778,9 @@ type scanner interface {
 
 func scanUpstream(row scanner) (Upstream, error) {
 	var u Upstream
-	var lastOK, lastErr sql.NullInt64
+	var lastOK, lastErr, proxyID sql.NullInt64
 	var lastErrS sql.NullString
-	err := row.Scan(&u.ID, &u.Name, &u.KeyEnc, &u.KeyPrefix, &u.KeyLast4, &u.Weight, &u.RPMLimit, &u.Status, &u.FailCount, &u.CooldownUntil, &lastOK, &lastErr, &lastErrS, &u.CreatedAt, &u.UpdatedAt)
+	err := row.Scan(&u.ID, &u.Name, &u.KeyEnc, &u.KeyPrefix, &u.KeyLast4, &u.Weight, &u.RPMLimit, &u.Status, &u.FailCount, &u.CooldownUntil, &lastOK, &lastErr, &lastErrS, &u.CreatedAt, &u.UpdatedAt, &proxyID)
 	if err != nil {
 		return u, err
 	}
@@ -610,7 +795,40 @@ func scanUpstream(row scanner) (Upstream, error) {
 	if lastErrS.Valid {
 		u.LastErr = lastErrS.String
 	}
+	if proxyID.Valid {
+		v := proxyID.Int64
+		u.ProxyID = &v
+	}
 	return u, nil
+}
+
+func scanProxy(row scanner, withBound bool) (Proxy, error) {
+	var p Proxy
+	var lastOK, lastErr sql.NullInt64
+	var lastErrS sql.NullString
+	args := []any{
+		&p.ID, &p.Name, &p.Protocol, &p.Host, &p.Port, &p.Username, &p.Password, &p.Status,
+		&p.FailCount, &p.CooldownUntil, &lastOK, &lastErr, &lastErrS, &p.LastIP, &p.LastCountry,
+		&p.LastLatencyMS, &p.CreatedAt, &p.UpdatedAt,
+	}
+	if withBound {
+		args = append(args, &p.BoundCount)
+	}
+	if err := row.Scan(args...); err != nil {
+		return p, err
+	}
+	if lastOK.Valid {
+		v := lastOK.Int64
+		p.LastOKAt = &v
+	}
+	if lastErr.Valid {
+		v := lastErr.Int64
+		p.LastErrAt = &v
+	}
+	if lastErrS.Valid {
+		p.LastErr = lastErrS.String
+	}
+	return p, nil
 }
 
 func scanUser(row scanner) (UserKey, error) {
@@ -643,6 +861,13 @@ func nstr(v, d string) string {
 		return d
 	}
 	return v
+}
+
+func nullInt(v *int64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 func PrefixLast4(plain string) (string, string) {

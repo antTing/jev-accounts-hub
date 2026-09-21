@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -191,5 +193,115 @@ func TestModelsCatalogPassthrough(t *testing.T) {
 	}
 	if len(cat.Models) != 1 || cat.Models[0].Name != "jev-latest" {
 		t.Fatalf("catalog %+v", cat)
+	}
+}
+
+func TestGatewayBoundProxyAndNoDirectLeak(t *testing.T) {
+	var upstreamHits int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"jev-1.13.0","answers":{"ok":{"noul":1}},"usage":{"input_tokens":3,"output_tokens":0}}`)
+	}))
+	defer up.Close()
+
+	var proxyHits int
+	hop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits++
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		req.Header = r.Header.Clone()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), 502)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer hop.Close()
+
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	master, _ := cryptox.RandomKey32()
+	box, _ := cryptox.NewAESGCM(master)
+	enc, _ := box.Encrypt([]byte("jev_upstream_secret"))
+	u, err := url.Parse(hop.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, _ := strconv.Atoi(u.Port())
+	pxID, err := st.InsertProxy(context.Background(), store.Proxy{
+		Name: "hop", Protocol: "http", Host: u.Hostname(), Port: port, Status: "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := pxID
+	_, err = st.InsertUpstream(context.Background(), store.Upstream{
+		Name: "u1", KeyEnc: enc, KeyPrefix: "jev_", KeyLast4: "cret", Weight: 1, RPMLimit: 1000, Status: "active", ProxyID: &pid,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := "sk-jev-" + strings.Repeat("p", 40)
+	_, err = st.InsertUserKey(context.Background(), store.UserKey{
+		Name: "user", KeyHash: cryptox.HashAPIKey(plain), KeyPrefix: "sk-jev-", KeyLast4: "pppp",
+		RPMLimit: 60, Status: "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gw := New(st, pool.New(st, box), ratelimit.New(), up.URL, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	req := httptest.NewRequest(http.MethodPost, "/v1/systemone", bytes.NewBufferString(`{"state":"hi","questions":{"ok":{"type":"noul","instructions":"x"}}}`))
+	req.Header.Set("Authorization", "Bearer "+plain)
+	user, err := gw.Authenticate(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	gw.SystemOne(rec, req, user, "rid")
+	if rec.Code != 200 {
+		t.Fatalf("status %d body %s proxyHits %d upstreamHits %d", rec.Code, rec.Body.String(), proxyHits, upstreamHits)
+	}
+	if proxyHits < 1 {
+		t.Fatal("expected request to go through bound proxy")
+	}
+
+	dead := int64(0)
+	deadID, err := st.InsertProxy(context.Background(), store.Proxy{
+		Name: "dead", Protocol: "http", Host: "127.0.0.1", Port: 1, Status: "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead = deadID
+	items, _ := st.ListUpstreams(context.Background())
+	if err := st.UpdateUpstream(context.Background(), items[0].ID, items[0].Name, items[0].Weight, items[0].RPMLimit, "active", nil, "", "", "", &dead, true); err != nil {
+		t.Fatal(err)
+	}
+	before := upstreamHits
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/systemone", bytes.NewBufferString(`{"state":"hi","questions":{"ok":{"type":"noul","instructions":"x"}}}`))
+	req2.Header.Set("Authorization", "Bearer "+plain)
+	rec2 := httptest.NewRecorder()
+	gw.SystemOne(rec2, req2, user, "rid2")
+	if rec2.Code == 200 {
+		t.Fatalf("dead bound proxy must not succeed via direct, body %s", rec2.Body.String())
+	}
+	if upstreamHits != before {
+		t.Fatalf("dead bound proxy leaked to direct: hits %d -> %d", before, upstreamHits)
 	}
 }

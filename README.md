@@ -1,4 +1,4 @@
-# jev-hub
+# jev-accounts-hub
 
 TypeSafe / Jev 的多账户管理器和 API 网关。
 
@@ -10,7 +10,7 @@ TypeSafe / Jev 的多账户管理器和 API 网关。
   TYPESAFE_API_KEY  = sk-jev-xxxxxxxx   ← 本服务签发的用户 Key
         │
         ▼
-   jev-hub
+   jev-accounts-hub
    账户池 / 鉴权 / RPM / token 配额 / 429 换号
         │
         ▼
@@ -24,6 +24,7 @@ TypeSafe / Jev 的多账户管理器和 API 网关。
 ## Features
 
 - 多账户池：按权重轮询，429 / 529 / 5xx / 401 自动换号
+- 出站代理池：HTTP / HTTPS / SOCKS5，账号可绑固定代理，不绑则从池轮询，池空才直连
 - 用户 Key：RPM、token 配额、备注、过期与停用
 - 上游 Key 落库 AES-256 加密，管理台只显示掩码
 - 调用日志、用量统计、探活、试玩
@@ -47,18 +48,18 @@ TypeSafe / Jev 的多账户管理器和 API 网关。
 
 官方当前能力（以 TypeSafe 文档为准，可能会变）：
 
-| 项 | 值 |
-|---|---|
-| 模型 | `jev-latest`、`jev-preview`、`jev-1.13.0` |
-| 计费 | 按 input tokens，output 免费 |
-| 单账户限流 | 约 1200 RPM / 250k tokens/s |
-| 上下文 | 64k tokens |
+| 项         | 值                                        |
+| ---------- | ----------------------------------------- |
+| 模型       | `jev-latest`、`jev-preview`、`jev-1.13.0` |
+| 计费       | 按 input tokens，output 免费              |
+| 单账户限流 | 约 1200 RPM / 250k tokens/s               |
+| 上下文     | 64k tokens                                |
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/<you>/jev-hub.git
-cd jev-hub
+git clone https://github.com/<you>/jev-accounts-hub.git
+cd jev-accounts-hub
 docker compose up --build
 ```
 
@@ -70,11 +71,11 @@ go run ./cmd/jevproxy
 
 首次启动会在 `./data/` 生成：
 
-| 文件 | 作用 |
-|---|---|
-| `admin.token` | 管理台口令 |
-| `master.key` | AES-256 主密钥，用来加密落库的上游 Key |
-| `jevproxy.db` | SQLite：账户、用户 Key、调用日志 |
+| 文件          | 作用                                   |
+| ------------- | -------------------------------------- |
+| `admin.token` | 管理台口令                             |
+| `master.key`  | AES-256 主密钥，用来加密落库的上游 Key |
+| `jevproxy.db` | SQLite：账户、用户 Key、调用日志       |
 
 打开 http://127.0.0.1:8080 ，把 `data/admin.token` 整行贴进登录框。这不是 TypeSafe 的 `jev_` Key。也可以用环境变量 `JEVPROXY_ADMIN_TOKEN` 自己指定。
 
@@ -130,22 +131,32 @@ curl -s http://127.0.0.1:8080/v1/models \
 
 请求里 `model` 可写：
 
-| 名字 | 实际跑 |
-|---|---|
-| `jev-latest` | `jev-1.13.0` |
+| 名字          | 实际跑       |
+| ------------- | ------------ |
+| `jev-latest`  | `jev-1.13.0` |
 | `jev-preview` | `jev-1.13.0` |
-| `jev-1.13.0` | 钉死这一版 |
+| `jev-1.13.0`  | 钉死这一版   |
 
 ## Admin UI
 
 打开 http://127.0.0.1:8080 ，贴 `data/admin.token`。
 
-| 页 | 做什么 |
-|---|---|
-| 上游 Key | 导入账户、批量导入、探活、停用、权重 / RPM |
-| 用户 Key | 签发、备注、RPM / token 配额、清零用量 |
-| 调用日志 | 按时间、成功/失败、用户、上游、错误关键字筛 |
-| 试玩 | 用账户池直接打 `POST /v1/systemone`，不消耗用户配额 |
+| 页       | 做什么                                                         |
+| -------- | -------------------------------------------------------------- |
+| 上游 Key | 导入账户、批量导入、探活、停用、权重 / RPM、绑定出口代理       |
+| 代理池   | 添加 / 批量导入 HTTP·SOCKS5 代理、探活（出口 IP / 国家）、启停 |
+| 用户 Key | 签发、备注、RPM / token 配额、清零用量                         |
+| 调用日志 | 按时间、成功/失败、用户、上游、错误关键字筛                    |
+| 试玩     | 用账户池直接打 `POST /v1/systemone`，不消耗用户配额            |
+
+上游出站走代理：账号可绑固定代理；不绑则从活跃池轮询；池空才直连。绑定代理不可用时**不会**回退直连（避免 IP 关联）。批量导入支持：
+
+```text
+socks5://user:pass@10.0.0.1:1080
+http://1.2.3.4:8080
+us-east socks5://10.0.0.2:1080
+1.2.3.4:3128:user:pass
+```
 
 批量导入每行一条，支持空格、逗号，或 `----` 分隔：
 

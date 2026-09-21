@@ -206,3 +206,104 @@ func itoa(n int64) string {
 	b, _ := json.Marshal(n)
 	return string(b)
 }
+
+func TestAdminProxyCRUDAndBind(t *testing.T) {
+	s, st := testServer(t, "http://127.0.0.1:1")
+	h := s.Handler()
+
+	rec := adminReq(h, http.MethodPost, "/admin/api/proxies", `{"url":"http://user:pass@10.1.2.3:8080","name":"us-1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("create %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID       int64  `json:"id"`
+		Protocol string `json:"protocol"`
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+		Username string `json:"username"`
+		Name     string `json:"name"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == 0 || created.Host != "10.1.2.3" || created.Port != 8080 || created.Username != "user" || created.Name != "us-1" {
+		t.Fatalf("created %+v", created)
+	}
+
+	rec = adminReq(h, http.MethodPost, "/admin/api/proxies", `{"url":"http://user:pass@10.1.2.3:8080"}`)
+	if rec.Code != 409 {
+		t.Fatalf("dup %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = adminReq(h, http.MethodPost, "/admin/api/proxies/import", `{"text":"socks5://127.0.0.1:1080\nhttp://user:pass@10.1.2.3:8080\nbadline"}`)
+	if rec.Code != 201 {
+		t.Fatalf("import %d %s", rec.Code, rec.Body.String())
+	}
+	var imp struct {
+		Created int `json:"created"`
+		Skipped int `json:"skipped"`
+		Failed  int `json:"failed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &imp); err != nil {
+		t.Fatal(err)
+	}
+	if imp.Created != 1 || imp.Skipped != 1 || imp.Failed != 1 {
+		t.Fatalf("import %+v", imp)
+	}
+
+	rec = adminReq(h, http.MethodGet, "/admin/api/proxies", "")
+	if rec.Code != 200 {
+		t.Fatalf("list %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = adminReq(h, http.MethodPost, "/admin/api/upstreams", `{"api_key":"jev_proxybind1","proxy_id":`+itoa(created.ID)+`}`)
+	if rec.Code != 201 {
+		t.Fatalf("up create %d %s", rec.Code, rec.Body.String())
+	}
+	var up struct {
+		ID      int64  `json:"id"`
+		ProxyID *int64 `json:"proxy_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &up); err != nil {
+		t.Fatal(err)
+	}
+	if up.ProxyID == nil || *up.ProxyID != created.ID {
+		t.Fatalf("bound %+v", up.ProxyID)
+	}
+
+	rec = adminReq(h, http.MethodPut, "/admin/api/upstreams/"+itoa(up.ID), `{"proxy_id":0}`)
+	if rec.Code != 200 {
+		t.Fatalf("force direct %d %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &up); err != nil {
+		t.Fatal(err)
+	}
+	if up.ProxyID == nil || *up.ProxyID != 0 {
+		t.Fatalf("direct %+v", up.ProxyID)
+	}
+
+	rec = adminReq(h, http.MethodPut, "/admin/api/upstreams/"+itoa(up.ID), `{"proxy_id":null}`)
+	if rec.Code != 200 {
+		t.Fatalf("pool %d %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &up); err != nil {
+		t.Fatal(err)
+	}
+	if up.ProxyID != nil {
+		t.Fatalf("pool mode want nil got %+v", up.ProxyID)
+	}
+
+	rec = adminReq(h, http.MethodPut, "/admin/api/upstreams/"+itoa(up.ID), `{"proxy_id":999}`)
+	if rec.Code != 400 {
+		t.Fatalf("missing proxy %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = adminReq(h, http.MethodDelete, "/admin/api/proxies/"+itoa(created.ID), "")
+	if rec.Code != 200 {
+		t.Fatalf("del %d %s", rec.Code, rec.Body.String())
+	}
+	_, err := st.GetProxy(context.Background(), created.ID)
+	if err != store.ErrNotFound {
+		t.Fatalf("deleted err %v", err)
+	}
+}
