@@ -65,6 +65,13 @@ func TestUpstreamHashDedupAndLogs(t *testing.T) {
 	if stt.Upstreams != 1 || stt.UserKeys != 1 || stt.ReqTotal < 2 {
 		t.Fatalf("stats %+v", stt)
 	}
+	usage, err := st.UpstreamUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage[id].InputTokens != 3 || usage[id].Requests != 1 {
+		t.Fatalf("usage %+v", usage)
+	}
 	_ = time.Now()
 }
 

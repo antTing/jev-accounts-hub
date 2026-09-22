@@ -351,6 +351,10 @@
             <button class="ghost" onclick="probeAll()">全部探活</button>
             <button class="ghost" onclick="loadAll()">刷新</button>
           </div>
+          <p class="muted">
+            经手用量只统计本网关成功转发的 input tokens，按 $42 / 十亿 tokens
+            估算，不是官方账户余额。
+          </p>
           <div class="card"><table id="upTable"></table></div>
           <div class="pager" id="upPager"></div>
         </section>
@@ -722,6 +726,37 @@ Stripe linking has failed for days.</textarea
       function n(v) {
         return Number(v || 0).toLocaleString();
       }
+      function usd(v) {
+        const x = Number(v || 0);
+        if (x > 0 && x < 0.01) return "< $0.01";
+        return (
+          "$" +
+          x.toLocaleString(undefined, {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2,
+          })
+        );
+      }
+      function quotaCell(x) {
+        const used = Number(x.tokens_used || 0);
+        const quota = Number(x.token_quota || 0);
+        if (!quota) {
+          return n(used) + ' <span class="muted">/ 不限</span>';
+        }
+        const left = quota - used;
+        const cls = left <= 0 ? "bad" : left <= quota * 0.1 ? "warn" : "ok";
+        return (
+          n(used) +
+          ' <span class="muted">/ ' +
+          n(quota) +
+          "</span>" +
+          '<div class="' +
+          cls +
+          '">剩余 ' +
+          n(left) +
+          "</div>"
+        );
+      }
       function spark(hourly) {
         const pts = hourly || [];
         if (!pts.length) return "";
@@ -873,7 +908,7 @@ Stripe linking has failed for days.</textarea
           function renderUp() {
           const upPage = pageSlice(window._ups, pages.up);
           $("upTable").innerHTML =
-            "<tr><th>ID</th><th>名称</th><th>Key</th><th>权重/RPM</th><th>代理</th><th>状态</th><th>失败</th><th>最近</th><th></th></tr>" +
+            "<tr><th>ID</th><th>名称</th><th>Key</th><th>权重/RPM</th><th>代理</th><th>经手用量</th><th>状态</th><th>失败</th><th>最近</th><th></th></tr>" +
             upPage.rows
               .map((x) => {
                 const cool =
@@ -899,6 +934,14 @@ Stripe linking has failed for days.</textarea
                   "<td>" +
                   proxyLabel(x.proxy_id) +
                   "</td>" +
+                  "<td>" +
+                  n(x.input_tokens) +
+                  ' <span class="muted">in</span>' +
+                  '<div class="muted">' +
+                  usd(x.est_usd) +
+                  " · " +
+                  n(x.requests) +
+                  " 次</div></td>" +
                   '<td class="' +
                   (x.status === "active" ? "ok" : "bad") +
                   '">' +
@@ -945,7 +988,7 @@ Stripe linking has failed for days.</textarea
           function renderKeys() {
           const keyPage = pageSlice(window._keys, pages.key);
           $("keyTable").innerHTML =
-            "<tr><th>ID</th><th>名称</th><th>Key</th><th>RPM</th><th>配额</th><th>已用</th><th>备注</th><th>状态</th><th></th></tr>" +
+            "<tr><th>ID</th><th>名称</th><th>Key</th><th>RPM</th><th>额度</th><th>备注</th><th>状态</th><th></th></tr>" +
             keyPage.rows
               .map(
                 (x) =>
@@ -960,9 +1003,7 @@ Stripe linking has failed for days.</textarea
                   "<td>" +
                   x.rpm_limit +
                   "</td><td>" +
-                  (x.token_quota || "∞") +
-                  "</td><td>" +
-                  x.tokens_used +
+                  quotaCell(x) +
                   "</td>" +
                   '<td class="muted">' +
                   esc(x.note || "") +

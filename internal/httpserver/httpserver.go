@@ -200,20 +200,27 @@ func (s *Server) adminStats(c *gin.Context) {
 }
 
 type upstreamDTO struct {
-	ID            int64  `json:"id"`
-	Name          string `json:"name"`
-	Mask          string `json:"mask"`
-	Weight        int    `json:"weight"`
-	RPMLimit      int    `json:"rpm_limit"`
-	Status        string `json:"status"`
-	FailCount     int    `json:"fail_count"`
-	CooldownUntil int64  `json:"cooldown_until"`
-	LastOKAt      *int64 `json:"last_ok_at"`
-	LastErrAt     *int64 `json:"last_err_at"`
-	LastErr       string `json:"last_err"`
-	CreatedAt     int64  `json:"created_at"`
-	ProxyID       *int64 `json:"proxy_id"`
+	ID            int64   `json:"id"`
+	Name          string  `json:"name"`
+	Mask          string  `json:"mask"`
+	Weight        int     `json:"weight"`
+	RPMLimit      int     `json:"rpm_limit"`
+	Status        string  `json:"status"`
+	FailCount     int     `json:"fail_count"`
+	CooldownUntil int64   `json:"cooldown_until"`
+	LastOKAt      *int64  `json:"last_ok_at"`
+	LastErrAt     *int64  `json:"last_err_at"`
+	LastErr       string  `json:"last_err"`
+	CreatedAt     int64   `json:"created_at"`
+	ProxyID       *int64  `json:"proxy_id"`
+	InputTokens   int64   `json:"input_tokens"`
+	Requests      int64   `json:"requests"`
+	EstUSD        float64 `json:"est_usd"`
 }
+
+// TypeSafe public price: $42 per billion input tokens. Output is free.
+// This estimates only traffic recorded by this gateway, not the official balance.
+const inputUSDPerToken = 42.0 / 1_000_000_000
 
 func toUpstreamDTO(u store.Upstream) upstreamDTO {
 	return upstreamDTO{
@@ -230,9 +237,20 @@ func (s *Server) adminListUpstreams(c *gin.Context) {
 		s.fail(c, 500, err.Error())
 		return
 	}
+	usage, err := s.store.UpstreamUsage(c.Request.Context())
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
 	out := make([]upstreamDTO, 0, len(items))
-	for _, u := range items {
-		out = append(out, toUpstreamDTO(u))
+	for _, item := range items {
+		dto := toUpstreamDTO(item)
+		if u, ok := usage[item.ID]; ok {
+			dto.InputTokens = u.InputTokens
+			dto.Requests = u.Requests
+			dto.EstUSD = float64(u.InputTokens) * inputUSDPerToken
+		}
+		out = append(out, dto)
 	}
 	c.JSON(200, gin.H{"items": out})
 }

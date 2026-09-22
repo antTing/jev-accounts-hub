@@ -276,6 +276,29 @@ func (s *Store) ListUpstreams(ctx context.Context) ([]Upstream, error) {
 	return out, rows.Err()
 }
 
+type UpstreamUsage struct {
+	InputTokens int64
+	Requests    int64
+}
+
+func (s *Store) UpstreamUsage(ctx context.Context) (map[int64]UpstreamUsage, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT upstream_id, COALESCE(SUM(input_tokens),0), COUNT(*) FROM usage_logs WHERE upstream_id IS NOT NULL AND ok=1 GROUP BY upstream_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]UpstreamUsage{}
+	for rows.Next() {
+		var id int64
+		var u UpstreamUsage
+		if err := rows.Scan(&id, &u.InputTokens, &u.Requests); err != nil {
+			return nil, err
+		}
+		out[id] = u
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) GetUpstream(ctx context.Context, id int64) (Upstream, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+upstreamCols+` FROM upstream_keys WHERE id=?`, id)
 	u, err := scanUpstream(row)
