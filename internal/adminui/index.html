@@ -262,6 +262,28 @@
       .bars i.ok {
         background: #2f6b4e;
       }
+      .pager {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .pager .ops {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .pager select {
+        padding: 4px 8px;
+      }
+      .pager button {
+        padding: 4px 10px;
+      }
       @media (max-width: 900px) {
         .row,
         .split {
@@ -281,7 +303,7 @@
   </head>
   <body>
     <header>
-      <h1>jev<span>-hub</span></h1>
+      <h1>jev<span>-accounts-hub</span></h1>
       <div
         id="headerAuth"
         class="hidden"
@@ -330,6 +352,7 @@
             <button class="ghost" onclick="loadAll()">刷新</button>
           </div>
           <div class="card"><table id="upTable"></table></div>
+          <div class="pager" id="upPager"></div>
         </section>
         <section id="proxies" class="hidden">
           <div class="toolbar">
@@ -342,6 +365,7 @@
             https / socks5。
           </p>
           <div class="card"><table id="pxTable"></table></div>
+          <div class="pager" id="pxPager"></div>
         </section>
         <section id="keys" class="hidden">
           <div class="toolbar">
@@ -350,16 +374,17 @@
           </div>
           <div id="newPlain"></div>
           <div class="card"><table id="keyTable"></table></div>
+          <div class="pager" id="keyPager"></div>
         </section>
         <section id="logs" class="hidden">
           <div class="toolbar">
-            <select id="logRange" onchange="loadLogs()">
+            <select id="logRange" onchange="resetLogs()">
               <option value="">全部</option>
               <option value="1h">最近 1 小时</option>
               <option value="24h" selected>最近 24 小时</option>
               <option value="7d">最近 7 天</option>
             </select>
-            <select id="logOk" onchange="loadLogs()">
+            <select id="logOk" onchange="resetLogs()">
               <option value="">成功/失败</option>
               <option value="true">仅成功</option>
               <option value="false">仅失败</option>
@@ -368,24 +393,24 @@
               id="logUser"
               placeholder="用户 Key ID"
               style="width: 120px"
-              onkeydown="if(event.key==='Enter')loadLogs()"
+              onkeydown="if(event.key==='Enter')resetLogs()"
             />
             <input
               id="logUp"
               placeholder="上游 ID"
               style="width: 100px"
-              onkeydown="if(event.key==='Enter')loadLogs()"
+              onkeydown="if(event.key==='Enter')resetLogs()"
             />
             <input
               id="logQ"
               placeholder="搜错误 / 模型 / request id"
               style="min-width: 220px"
-              onkeydown="if(event.key==='Enter')loadLogs()"
+              onkeydown="if(event.key==='Enter')resetLogs()"
             />
-            <button class="ghost" onclick="loadLogs()">筛选</button>
+            <button class="ghost" onclick="resetLogs()">筛选</button>
           </div>
           <div class="card"><table id="logTable"></table></div>
-          <p class="muted" id="logMeta"></p>
+          <div class="pager" id="logPager"></div>
         </section>
         <section id="play" class="hidden">
           <div class="split">
@@ -578,6 +603,71 @@ Stripe linking has failed for days.</textarea
           $(id).classList.toggle("hidden", id !== btn.dataset.tab)
         );
       }
+      const pageSizeChoices = [10, 20, 50];
+      const pages = {
+        up: { page: 1, size: 20 },
+        px: { page: 1, size: 20 },
+        key: { page: 1, size: 20 },
+        log: { page: 1, size: 20, total: 0 },
+      };
+      function pageSlice(items, state) {
+        const total = items.length;
+        const pagesN = Math.max(1, Math.ceil(total / state.size));
+        if (state.page > pagesN) state.page = pagesN;
+        if (state.page < 1) state.page = 1;
+        const start = (state.page - 1) * state.size;
+        return { rows: items.slice(start, start + state.size), total, pagesN };
+      }
+      function renderPager(id, state, total, onChange) {
+        const el = $(id);
+        if (!el) return;
+        const pagesN = Math.max(1, Math.ceil(total / state.size) || 1);
+        if (state.page > pagesN) state.page = pagesN;
+        const opts = pageSizeChoices
+          .map(
+            (n) =>
+              '<option value="' +
+              n +
+              '"' +
+              (n === state.size ? " selected" : "") +
+              ">" +
+              n +
+              " 条/页</option>"
+          )
+          .join("");
+        el.innerHTML =
+          "<span>共 " +
+          total +
+          " 条 · 第 " +
+          state.page +
+          " / " +
+          pagesN +
+          " 页</span>" +
+          '<span class="ops"><select data-act="size">' +
+          opts +
+          "</select>" +
+          '<button class="ghost" data-act="prev"' +
+          (state.page <= 1 ? " disabled" : "") +
+          ">上一页</button>" +
+          '<button class="ghost" data-act="next"' +
+          (state.page >= pagesN ? " disabled" : "") +
+          ">下一页</button></span>";
+        el.querySelector("[data-act=size]").onchange = (e) => {
+          state.size = Number(e.target.value) || 20;
+          state.page = 1;
+          onChange();
+        };
+        el.querySelector("[data-act=prev]").onclick = () => {
+          if (state.page <= 1) return;
+          state.page--;
+          onChange();
+        };
+        el.querySelector("[data-act=next]").onclick = () => {
+          if (state.page >= pagesN) return;
+          state.page++;
+          onChange();
+        };
+      }
       function ts(ms) {
         if (!ms) return "-";
         return new Date(ms).toLocaleString();
@@ -708,9 +798,12 @@ Stripe linking has failed for days.</textarea
           window._proxies = px.items || [];
           fillProxySelect($("upProxy"), "");
           const now = Date.now();
+          renderPx();
+          function renderPx() {
+          const pxPage = pageSlice(window._proxies, pages.px);
           $("pxTable").innerHTML =
             "<tr><th>ID</th><th>名称</th><th>地址</th><th>出口</th><th>绑定</th><th>状态</th><th>延迟</th><th></th></tr>" +
-            window._proxies
+            pxPage.rows
               .map((x) => {
                 const cool =
                   x.cooldown_until > now
@@ -772,11 +865,16 @@ Stripe linking has failed for days.</textarea
                 );
               })
               .join("");
+          renderPager("pxPager", pages.px, pxPage.total, renderPx);
+          }
           const u = await api("/upstreams");
           window._ups = u.items || [];
+          renderUp();
+          function renderUp() {
+          const upPage = pageSlice(window._ups, pages.up);
           $("upTable").innerHTML =
             "<tr><th>ID</th><th>名称</th><th>Key</th><th>权重/RPM</th><th>代理</th><th>状态</th><th>失败</th><th>最近</th><th></th></tr>" +
-            (u.items || [])
+            upPage.rows
               .map((x) => {
                 const cool =
                   x.cooldown_until > now
@@ -839,11 +937,16 @@ Stripe linking has failed for days.</textarea
                 );
               })
               .join("");
+          renderPager("upPager", pages.up, upPage.total, renderUp);
+          }
           const k = await api("/keys");
           window._keys = k.items || [];
+          renderKeys();
+          function renderKeys() {
+          const keyPage = pageSlice(window._keys, pages.key);
           $("keyTable").innerHTML =
             "<tr><th>ID</th><th>名称</th><th>Key</th><th>RPM</th><th>配额</th><th>已用</th><th>备注</th><th>状态</th><th></th></tr>" +
-            (k.items || [])
+            keyPage.rows
               .map(
                 (x) =>
                   "<tr>" +
@@ -889,14 +992,21 @@ Stripe linking has failed for days.</textarea
                   "</td></tr>"
               )
               .join("");
+          renderPager("keyPager", pages.key, keyPage.total, renderKeys);
+          }
           await loadLogs();
         } catch (e) {
           err(e.message);
         }
       }
+      function resetLogs() {
+        pages.log.page = 1;
+        return loadLogs();
+      }
       async function loadLogs() {
         const qs = new URLSearchParams();
-        qs.set("limit", "80");
+        qs.set("limit", String(pages.log.size));
+        qs.set("offset", String((pages.log.page - 1) * pages.log.size));
         const range = $("logRange").value;
         if (range) qs.set("range", range);
         const ok = $("logOk").value;
@@ -908,7 +1018,13 @@ Stripe linking has failed for days.</textarea
         const q = $("logQ").value.trim();
         if (q) qs.set("q", q);
         const l = await api("/logs?" + qs.toString());
-        $("logMeta").textContent = "共 " + (l.total || 0) + " 条";
+        pages.log.total = l.total || 0;
+        const pagesN = Math.max(1, Math.ceil(pages.log.total / pages.log.size) || 1);
+        if (pages.log.page > pagesN) {
+          pages.log.page = pagesN;
+          return loadLogs();
+        }
+        renderPager("logPager", pages.log, pages.log.total, loadLogs);
         $("logTable").innerHTML =
           "<tr><th>时间</th><th>用户</th><th>上游</th><th>模型</th><th>tokens</th><th>ms</th><th>状态</th><th>错误 / rid</th></tr>" +
           (l.items || [])
