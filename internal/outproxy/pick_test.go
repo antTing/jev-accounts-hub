@@ -48,7 +48,7 @@ func TestPickBoundPoolDirect(t *testing.T) {
 		t.Fatal("missing bound should fail, not fall back")
 	}
 
-	if err := st.UpdateProxy(ctx, id, "p1", "http", "127.0.0.1", 8080, "", "", "disabled"); err != nil {
+	if err := st.UpdateProxy(ctx, id, "p1", "http", "127.0.0.1", 8080, "", nil, "disabled"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pk.Pick(ctx, store.Upstream{ProxyID: &bound}, nil); err == nil {

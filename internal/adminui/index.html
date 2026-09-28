@@ -312,6 +312,7 @@
         <span class="muted">交流群 1102910606</span>
         <span class="muted" id="creditState"></span>
         <span class="muted" id="authState">未登录</span>
+        <button class="ghost" onclick="openPass()">改密码</button>
         <button class="ghost" onclick="logout()">退出</button>
       </div>
     </header>
@@ -325,7 +326,7 @@
         <input id="loginPass" type="password" autocomplete="current-password" placeholder="至少 8 位" />
         <div class="toolbar" style="margin-top: 12px">
           <button onclick="submitAuth('login')">登录</button>
-          <button class="ghost" onclick="submitAuth('register')">注册</button>
+          <button class="ghost" id="regBtn" onclick="submitAuth('register')">注册</button>
         </div>
         <p class="muted" style="margin-top: 16px">也可以贴 <code>data/admin.token</code> 应急进入（管理员）。</p>
         <input id="token" type="password" placeholder="管理口令（可选）" autocomplete="off" />
@@ -432,6 +433,8 @@
             </div>
             <p class="muted">兑换后记入当前账号余额。1 积分 = $1。应急口令没有账号，不能兑换。</p>
           </div>
+          <h3 style="margin: 18px 0 8px">我的流水</h3>
+          <div class="card"><table id="myLedger"></table></div>
           <div class="admin-only" style="margin-top: 16px">
             <div class="toolbar">
               <input id="codeCredits" type="number" min="1" step="1" value="10" style="width: 120px" />
@@ -451,6 +454,9 @@
           </div>
           <p class="muted">1 积分 = $1 调用额度。正数充值，负数扣减。调用按 $42 / 十亿 input tokens 扣积分。</p>
           <div class="card"><table id="acctTable"></table></div>
+          <h3 style="margin: 18px 0 8px">积分流水</h3>
+          <p class="muted">最近 50 条。正数入账，负数扣费。单位是美元。</p>
+          <div class="card"><table id="ledgerTable"></table></div>
         </section>
         <section id="play" class="hidden">
           <div class="split">
@@ -477,7 +483,7 @@ Stripe linking has failed for days.</textarea
                 <button class="ghost" onclick="fillPlay()">填默认</button>
               </div>
               <p class="muted">
-                用当前账号的积分试一次，按 $42 / 十亿 input tokens 扣。余额为 0 时不能试。应急口令没有账号，不扣积分。
+                用当前账号的积分试一次，按 $42 / 十亿 input tokens 扣。余额为 0 时不能试。应急口令没有账号，不能试玩。
               </p>
             </div>
             <div class="card">
@@ -609,6 +615,10 @@ Stripe linking has failed for days.</textarea
             ><input id="keyQuota" type="number" value="0" />
           </div>
         </div>
+        <div class="admin-only" id="keyOwnerWrap">
+          <label>归属账号</label>
+          <select id="keyOwner"></select>
+        </div>
         <p class="muted" id="keyDlgHint"></p>
         <div class="toolbar" style="margin-top: 12px">
           <button onclick="saveKey()">签发</button>
@@ -734,11 +744,8 @@ Stripe linking has failed for days.</textarea
           ? me.username + (isAdmin() ? " · 管理员" : " · 用户")
           : "未登录";
         $("authState").textContent = label;
-        const usd =
-          me && me.credits != null
-            ? (Number(me.credits) / 1e6).toFixed(4)
-            : "";
-        $("creditState").textContent = me ? "积分 $" + usd : "";
+        $("creditState").textContent =
+          me && me.credits != null ? "积分 " + microUSD(me.credits) : "";
       }
       function showApp(on) {
         $("gate").classList.toggle("hidden", on);
@@ -746,6 +753,49 @@ Stripe linking has failed for days.</textarea
         $("headerAuth").classList.toggle("hidden", !on);
         if (!on) me = null;
         applyRole();
+      }
+
+      async function loadAuthInfo() {
+        try {
+          const r = await fetch("/admin/api/auth-info");
+          const j = await r.json();
+          const open = !!(j && j.open_register);
+          if ($("regBtn")) $("regBtn").classList.toggle("hidden", !open);
+          if ($("gateHint")) {
+            $("gateHint").textContent = open
+              ? "管理员和普通用户分开登录。第一个注册的账号是管理员。"
+              : "注册已关闭。请使用已有账号登录。";
+          }
+        } catch (e) {}
+      }
+      function openPass() {
+        if (me && me.break_glass) {
+          err("应急口令没有密码可改");
+          return;
+        }
+        const oldp = prompt("原密码");
+        if (!oldp) return;
+        const np = prompt("新密码（至少 8 位）");
+        if (!np) return;
+        api("/password", { method: "POST", body: JSON.stringify({ old: oldp, new: np }) })
+          .then(() => {
+            alert("密码已更新，请重新登录");
+            logout();
+          })
+          .catch((e) => err(e.message));
+      }
+      async function setAccountStatus(id, status) {
+        const word = status === "disabled" ? "停用" : "启用";
+        if (!confirm(word + "账号 " + id + "？停用会踢下线并停用其 Key。")) return;
+        try {
+          await api("/accounts/" + id + "/status", {
+            method: "POST",
+            body: JSON.stringify({ status }),
+          });
+          await loadAccounts();
+        } catch (e) {
+          err(e.message);
+        }
       }
       async function submitAuth(kind) {
         $("gateErr").textContent = "";
@@ -815,6 +865,10 @@ Stripe linking has failed for days.</textarea
       function n(v) {
         return Number(v || 0).toLocaleString();
       }
+      function microUSD(v) {
+        const x = Number(v || 0) / 1e6;
+        return "$" + x.toFixed(6);
+      }
       function usd(v) {
         const x = Number(v || 0);
         if (x > 0 && x < 0.01) return "< $0.01";
@@ -827,16 +881,18 @@ Stripe linking has failed for days.</textarea
         );
       }
       function quotaCell(x) {
+        const used = n(x.tokens_used || 0) + ' <span class="muted">tokens</span>';
         if (x.owner_id == null || x.credits == null) {
-          return '<span class="muted">不扣积分</span>';
+          return used + '<div class="muted">不扣积分</div>';
         }
-        const usd = Number(x.credits) / 1e6;
-        const cls = usd <= 0 ? "bad" : usd < 1 ? "warn" : "ok";
+        const micro = Number(x.credits || 0);
+        const cls = micro <= 0 ? "bad" : micro < 1e6 ? "warn" : "ok";
         return (
+          used +
           '<div class="' +
           cls +
-          '">剩余 $' +
-          usd.toFixed(4) +
+          '">剩余 ' +
+          microUSD(micro) +
           "</div>"
         );
       }
@@ -1121,7 +1177,11 @@ Stripe linking has failed for days.</textarea
                       '<button class="ghost" onclick="resetKey(' +
                       x.id +
                       ')">清零用量</button> '
-                    : "") +
+                    : '<button class="ghost" onclick="editRpm(' +
+                      x.id +
+                      "," +
+                      x.rpm_limit +
+                      ')">改 RPM</button> ') +
                   '<button class="danger" onclick="delKey(' +
                   x.id +
                   ')">删除</button>' +
@@ -1135,6 +1195,7 @@ Stripe linking has failed for days.</textarea
             await loadAccounts();
             await loadCodes();
           }
+          await loadMyLedger();
           await refreshMe();
         } catch (e) {
           err(e.message);
@@ -1167,7 +1228,7 @@ Stripe linking has failed for days.</textarea
         }
         renderPager("logPager", pages.log, pages.log.total, loadLogs);
         $("logTable").innerHTML =
-          "<tr><th>时间</th><th>用户</th><th>上游</th><th>模型</th><th>tokens</th><th>ms</th><th>状态</th><th>错误 / rid</th></tr>" +
+          "<tr><th>时间</th><th>用户</th><th>上游</th><th>模型</th><th>tokens</th><th>扣费</th><th>ms</th><th>状态</th><th>错误 / rid</th></tr>" +
           (l.items || [])
             .map(
               (x) =>
@@ -1176,7 +1237,13 @@ Stripe linking has failed for days.</textarea
                 ts(x.created_at) +
                 "</td>" +
                 "<td>" +
-                x.user_key_id +
+                (x.user_key_id
+                  ? x.user_key_id
+                  : x.account_name
+                  ? esc(x.account_name)
+                  : x.account_id
+                  ? "#" + x.account_id
+                  : "-") +
                 "</td>" +
                 "<td>" +
                 (x.upstream_id || "-") +
@@ -1186,6 +1253,9 @@ Stripe linking has failed for days.</textarea
                 "</td>" +
                 "<td>" +
                 (x.input_tokens || 0) +
+                "</td>" +
+                "<td>" +
+                microUSD(x.credit_micro) +
                 "</td>" +
                 "<td>" +
                 (x.latency_ms || 0) +
@@ -1257,15 +1327,40 @@ Stripe linking has failed for days.</textarea
         $("pxImportText").value = "";
         $("pxImportDlg").showModal();
       }
+      function fillKeyOwners(current) {
+        const sel = $("keyOwner");
+        if (!sel) return;
+        const items = (window._accounts || []).filter((a) => a.status === "active");
+        sel.innerHTML = items
+          .map(
+            (a) =>
+              '<option value="' +
+              a.id +
+              '">' +
+              esc(a.username) +
+              " · $" +
+              Number(a.credits_usd || 0).toFixed(6) +
+              "</option>"
+          )
+          .join("");
+        if (!items.length) {
+          sel.innerHTML = '<option value="">没有可用账号</option>';
+          return;
+        }
+        const id = current || (me && me.id) || items[0].id;
+        sel.value = String(id);
+        if (sel.value === "") sel.value = String(items[0].id);
+      }
       function openKey() {
         $("keyName").value = "";
         $("keyNote").value = "";
         $("keyRpm").value = "60";
         if ($("keyQuota")) $("keyQuota").value = "0";
+        fillKeyOwners();
         $("keyDlgTitle").textContent = isAdmin() ? "签发用户 Key" : "创建 API Key";
         $("keyDlgHint").textContent = isAdmin()
-          ? "管理员签发的 Key 记在当前账号名下。"
-          : "Key 只消耗你自己的积分。1 积分 = $1，按 $42 / 十亿 input tokens 扣。";
+          ? "Key 消耗所选账号的积分。余额为 0 的账号不能签发。"
+          : "Key 只消耗你自己的积分。1 积分 = $1，按 $42 / 十亿 input tokens 扣。RPM 可在 1–120 之间改。";
         if ($("keyHint")) {
           $("keyHint").textContent = isAdmin()
             ? ""
@@ -1286,8 +1381,10 @@ Stripe linking has failed for days.</textarea
           });
           $("redeemCode").value = "";
           err("");
-          alert("已兑换 $" + Number(r.added_usd || 0).toFixed(2) + "，余额 $" + Number(r.credits_usd || 0).toFixed(4));
+          alert("已兑换 " + microUSD(r.added) + "，余额 " + microUSD(r.credits));
           await refreshMe();
+          await loadMyLedger();
+          if (isAdmin()) await loadLedger();
           if (isAdmin()) await loadCodes();
         } catch (e) {
           err(e.message);
@@ -1355,11 +1452,55 @@ Stripe linking has failed for days.</textarea
           applyRole();
         } catch (e) {}
       }
+      function ledgerRows(items) {
+        const reasonName = { adjust: "调整", redeem: "兑换", hold: "预扣", settle: "结算" };
+        return (
+          "<tr><th>时间</th><th>账号</th><th>变动</th><th>余额</th><th>原因</th><th>备注</th></tr>" +
+          (items || [])
+            .map((it) => {
+              const d = Number(it.delta || 0);
+              return (
+                "<tr><td>" +
+                ts(it.created_at) +
+                "</td><td>" +
+                it.account_id +
+                "</td><td class=\"" +
+                (d < 0 ? "bad" : "ok") +
+                '\">' +
+                (d > 0 ? "+" : "") +
+                microUSD(d) +
+                "</td><td>" +
+                microUSD(it.balance) +
+                "</td><td>" +
+                esc(reasonName[it.reason] || it.reason) +
+                '</td><td class="muted">' +
+                esc(it.note || it.ref || "") +
+                "</td></tr>"
+              );
+            })
+            .join("")
+        );
+      }
+      async function loadMyLedger() {
+        if (!$("myLedger")) return;
+        if (me && me.break_glass) {
+          $("myLedger").innerHTML = "";
+          return;
+        }
+        const r = await api("/ledger");
+        $("myLedger").innerHTML = ledgerRows(r.items);
+      }
+      async function loadLedger() {
+        if (!isAdmin() || !$("ledgerTable")) return;
+        const r = await api("/ledger");
+        $("ledgerTable").innerHTML = ledgerRows(r.items);
+      }
       async function loadAccounts() {
         if (!isAdmin()) return;
         const r = await api("/accounts");
+        window._accounts = r.items || [];
         $("acctTable").innerHTML =
-          "<tr><th>ID</th><th>用户名</th><th>角色</th><th>积分 ($)</th><th>调整</th></tr>" +
+          "<tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>积分 ($)</th><th>调整</th></tr>" +
           (r.items || [])
             .map(
               (a) =>
@@ -1369,16 +1510,28 @@ Stripe linking has failed for days.</textarea
                 esc(a.username) +
                 "</td><td>" +
                 esc(a.role) +
+                '</td><td class="' +
+                (a.status === "active" ? "ok" : "bad") +
+                '">' +
+                esc(a.status || "") +
                 "</td><td>" +
-                Number(a.credits_usd || 0).toFixed(4) +
+                Number(a.credits_usd || 0).toFixed(6) +
                 '</td><td><input id="cred' +
                 a.id +
                 '" type="number" step="1" placeholder="+10 或 -2" style="width:110px"/> ' +
                 '<button class="ghost" onclick="adjustCredits(' +
                 a.id +
-                ')">确定</button></td></tr>'
+                ')">确定</button> ' +
+                '<button class="ghost" onclick="setAccountStatus(' +
+                a.id +
+                ',\'' +
+                (a.status === 'disabled' ? 'active' : 'disabled') +
+                '\')">' +
+                (a.status === 'disabled' ? '启用' : '停用') +
+                '</button></td></tr>'
             )
             .join("");
+        await loadLedger();
       }
       async function adjustCredits(id) {
         const raw = $("cred" + id).value.trim();
@@ -1394,6 +1547,7 @@ Stripe linking has failed for days.</textarea
           });
           err("");
           await loadAccounts();
+          await loadLedger();
           await refreshMe();
         } catch (e) {
           err(e.message);
@@ -1576,14 +1730,23 @@ Stripe linking has failed for days.</textarea
       }
       async function saveKey() {
         try {
+          const body = {
+            name: $("keyName").value,
+            note: $("keyNote").value,
+            rpm_limit: Number($("keyRpm").value || 60),
+            token_quota: Number(($("keyQuota") && $("keyQuota").value) || 0),
+          };
+          if (isAdmin()) {
+            const owner = Number(($("keyOwner") && $("keyOwner").value) || 0);
+            if (!owner) {
+              err("请选择归属账号");
+              return;
+            }
+            body.owner_id = owner;
+          }
           const r = await api("/keys", {
             method: "POST",
-            body: JSON.stringify({
-              name: $("keyName").value,
-              note: $("keyNote").value,
-              rpm_limit: Number($("keyRpm").value || 60),
-              token_quota: Number($("keyQuota").value || 0),
-            }),
+            body: JSON.stringify(body),
           });
           $("keyDlg").close();
           $("newPlain").innerHTML =
@@ -1622,6 +1785,25 @@ Stripe linking has failed for days.</textarea
           body: JSON.stringify({ note }),
         });
         loadAll();
+      }
+      async function editRpm(id, cur) {
+        const raw = prompt("RPM（1–120）", String(cur || 60));
+        if (raw === null) return;
+        const rpm = Number(raw);
+        if (!Number.isInteger(rpm) || rpm < 1 || rpm > 120) {
+          err("RPM 须为 1 到 120");
+          return;
+        }
+        try {
+          await api("/keys/" + id, {
+            method: "PUT",
+            body: JSON.stringify({ rpm_limit: rpm }),
+          });
+          err("");
+          loadAll();
+        } catch (e) {
+          err(e.message);
+        }
       }
       function fillPlay() {
         $("playState").value = "Stripe linking has failed for days.";
@@ -1681,6 +1863,7 @@ Stripe linking has failed for days.</textarea
             }[c])
         );
       }
+      loadAuthInfo();
       if (token()) saveToken();
       else showApp(false);
     </script>

@@ -10,25 +10,27 @@ import (
 
 // Config 进程配置，全部来自环境变量。
 type Config struct {
-	Listen     string
-	DataDir    string
-	AdminToken string
-	MasterKey  string // 64 hex chars；空则启动时生成
-	Upstream   string
-	Timeout    time.Duration
-	LogFormat  string
-	Debug      bool
+	Listen       string
+	DataDir      string
+	AdminToken   string
+	MasterKey    string // 64 hex chars；空则启动时生成
+	Upstream     string
+	Timeout      time.Duration
+	LogFormat    string
+	Debug        bool
+	OpenRegister bool
 }
 
 func Load() (Config, error) {
 	c := Config{
-		Listen:    env("JEVPROXY_LISTEN", ":8080"),
-		DataDir:   env("JEVPROXY_DATA_DIR", "./data"),
-		AdminToken: strings.TrimSpace(os.Getenv("JEVPROXY_ADMIN_TOKEN")),
-		MasterKey:  strings.TrimSpace(os.Getenv("JEVPROXY_MASTER_KEY")),
-		Upstream:  strings.TrimRight(env("JEVPROXY_UPSTREAM", "https://api.typesafe.ai"), "/"),
-		LogFormat: env("JEVPROXY_LOG_FORMAT", "text"),
-		Debug:     env("JEVPROXY_DEBUG", "0") == "1",
+		Listen:       env("JEVPROXY_LISTEN", ":8080"),
+		DataDir:      env("JEVPROXY_DATA_DIR", "./data"),
+		AdminToken:   strings.TrimSpace(os.Getenv("JEVPROXY_ADMIN_TOKEN")),
+		MasterKey:    strings.TrimSpace(os.Getenv("JEVPROXY_MASTER_KEY")),
+		Upstream:     strings.TrimRight(env("JEVPROXY_UPSTREAM", "https://api.typesafe.ai"), "/"),
+		LogFormat:    env("JEVPROXY_LOG_FORMAT", "text"),
+		Debug:        env("JEVPROXY_DEBUG", "0") == "1",
+		OpenRegister: env("JEVPROXY_OPEN_REGISTER", "0") == "1",
 	}
 	to := env("JEVPROXY_TIMEOUT", "15s")
 	d, err := time.ParseDuration(to)

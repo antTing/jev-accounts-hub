@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"jevproxy/internal/cryptox"
@@ -303,5 +304,72 @@ func TestGatewayBoundProxyAndNoDirectLeak(t *testing.T) {
 	}
 	if upstreamHits != before {
 		t.Fatalf("dead bound proxy leaked to direct: hits %d -> %d", before, upstreamHits)
+	}
+}
+
+func TestHoldStopsConcurrentOverspend(t *testing.T) {
+	var hits int
+	var mu sync.Mutex
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"jev-1.13.0","answers":{"ok":{"noul":1}},"usage":{"input_tokens":1000,"output_tokens":0}}`)
+	}))
+	defer up.Close()
+
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	master, _ := cryptox.RandomKey32()
+	box, _ := cryptox.NewAESGCM(master)
+	enc, _ := box.Encrypt([]byte("jev_up"))
+	if _, err := st.InsertUpstream(context.Background(), store.Upstream{Name: "u", KeyEnc: enc, KeyPrefix: "jev_", KeyLast4: "upup", Weight: 1, RPMLimit: 1000, Status: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := st.InsertAccount(context.Background(), "alice", "hash", store.RoleUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AdjustCredits(context.Background(), id, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	owner := id
+	user := &store.UserKey{OwnerID: &owner}
+	gw := New(st, pool.New(st, box), ratelimit.New(), up.URL, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	body := []byte(`{"state":"hi","questions":{"ok":{"type":"noul","instructions":"x"}}}`)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res := gw.Evaluate(context.Background(), user, body, "r"+strconv.Itoa(i))
+			codes[i] = res.Status
+		}(i)
+	}
+	wg.Wait()
+	got200 := 0
+	for _, c := range codes {
+		if c == 200 {
+			got200++
+		}
+	}
+	if got200 != 1 {
+		t.Fatalf("statuses %v hits %d", codes, hits)
+	}
+	acc, err := st.GetAccount(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Credits >= 1 {
+		t.Fatalf("balance %d still positive", acc.Credits)
+	}
+	if hits != 1 {
+		t.Fatalf("upstream hits %d", hits)
 	}
 }

@@ -62,14 +62,21 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
+	if n, err := sealProxyPasswords(st, box); err != nil {
+		log.Error("seal proxy passwords", "err", err)
+		os.Exit(1)
+	} else if n > 0 {
+		log.Info("sealed proxy passwords", "count", n)
+	}
 
 	p := pool.New(st, box)
 	lim := ratelimit.New()
 	gw := proxy.New(st, p, lim, cfg.Upstream, cfg.Timeout, log)
 	srv := httpserver.New(httpserver.Config{
-		Listen:     cfg.Listen,
-		AdminToken: cfg.AdminToken,
-		Debug:      cfg.Debug,
+		Listen:       cfg.Listen,
+		AdminToken:   cfg.AdminToken,
+		Debug:        cfg.Debug,
+		OpenRegister: cfg.OpenRegister,
 	}, st, box, p, gw, log)
 
 	log.Info("jevproxy starting",
@@ -156,4 +163,27 @@ func uiPort(listen string) string {
 		return ":8080"
 	}
 	return listen
+}
+
+// sealProxyPasswords 把升级前落在 password 列里的明文改成主密钥密文。
+func sealProxyPasswords(st *store.Store, box *cryptox.AESGCM) (int, error) {
+	items, err := st.ListProxies(context.Background())
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, p := range items {
+		if p.Password == "" || len(p.PasswordEnc) > 0 {
+			continue
+		}
+		enc, err := box.Encrypt([]byte(p.Password))
+		if err != nil {
+			return n, err
+		}
+		if err := st.UpdateProxy(context.Background(), p.ID, p.Name, p.Protocol, p.Host, p.Port, p.Username, enc, p.Status); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
 }

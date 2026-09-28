@@ -109,3 +109,16 @@ func (p *Pool) Decrypt(u store.Upstream) (string, error) {
 	}
 	return string(b), nil
 }
+
+// OpenProxy 解出代理密码。没有密文时沿用明文（升级前的旧行）。
+func (p *Pool) OpenProxy(pr store.Proxy) (store.Proxy, error) {
+	if len(pr.PasswordEnc) == 0 {
+		return pr, nil
+	}
+	b, err := p.box.Decrypt(pr.PasswordEnc)
+	if err != nil {
+		return pr, err
+	}
+	pr.Password = string(b)
+	return pr, nil
+}

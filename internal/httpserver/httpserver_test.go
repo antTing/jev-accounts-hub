@@ -54,7 +54,7 @@ func testServer(t *testing.T, upstreamURL string) (*Server, *store.Store) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	p := pool.New(st, box)
 	gw := proxy.New(st, p, ratelimit.New(), upstreamURL, 0, log)
-	s := New(Config{Listen: ":0", AdminToken: "admintok"}, st, box, p, gw, log)
+	s := New(Config{Listen: ":0", AdminToken: "admintok", OpenRegister: true}, st, box, p, gw, log)
 	return s, st
 }
 
@@ -118,6 +118,27 @@ func TestAdminImportAndLogsFilter(t *testing.T) {
 	}
 
 	rec = adminReq(h, http.MethodPost, "/admin/api/keys", `{"name":"alice","note":"sdk","rpm_limit":30,"token_quota":0}`)
+	if rec.Code != 400 {
+		t.Fatalf("break-glass key %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"pay","password":"password1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("register pay %d %s", rec.Code, rec.Body.String())
+	}
+	var pay struct {
+		Token   string `json:"token"`
+		Account struct {
+			ID int64 `json:"id"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &pay); err != nil {
+		t.Fatal(err)
+	}
+	rec = adminReq(h, http.MethodPost, "/admin/api/accounts/"+itoa(pay.Account.ID)+"/credits", `{"delta":2}`)
+	if rec.Code != 200 {
+		t.Fatalf("fund %d %s", rec.Code, rec.Body.String())
+	}
+	rec = adminReq(h, http.MethodPost, "/admin/api/keys", `{"name":"alice","note":"sdk","rpm_limit":30,"token_quota":0,"owner_id":`+itoa(pay.Account.ID)+`}`)
 	if rec.Code != 201 {
 		t.Fatalf("create key %d %s", rec.Code, rec.Body.String())
 	}
@@ -146,7 +167,7 @@ func TestAdminImportAndLogsFilter(t *testing.T) {
 		t.Fatalf("user %+v", k)
 	}
 
-	rec = adminReq(h, http.MethodPost, "/admin/api/playground", `{
+	rec = authJSON(h, http.MethodPost, "/admin/api/playground", pay.Token, `{
 		"state":"hi","model":"jev-latest","questions":{"ok":{"type":"noul","instructions":"x"}}
 	}`)
 	if rec.Code != 200 {
@@ -217,6 +238,7 @@ func TestAccountRoles(t *testing.T) {
 	var admin struct {
 		Token   string `json:"token"`
 		Account struct {
+			ID   int64  `json:"id"`
 			Role string `json:"role"`
 		} `json:"account"`
 	}
@@ -287,6 +309,30 @@ func TestAccountRoles(t *testing.T) {
 		t.Fatalf("owner %+v want %d", k.OwnerID, user.Account.ID)
 	}
 
+	rec = authJSON(h, http.MethodPut, "/admin/api/keys/"+itoa(mine.ID), user.Token, `{"rpm_limit":30,"note":"hack","token_quota":9}`)
+	if rec.Code != 200 {
+		t.Fatalf("user rpm %d %s", rec.Code, rec.Body.String())
+	}
+	k, err = st.GetUserKey(context.Background(), mine.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k.RPMLimit != 30 || k.Note != "" || k.TokenQuota != 0 {
+		t.Fatalf("rpm-only %+v", k)
+	}
+	rec = authJSON(h, http.MethodPut, "/admin/api/keys/"+itoa(mine.ID), user.Token, `{"rpm_limit":500}`)
+	if rec.Code != 400 {
+		t.Fatalf("bad rpm %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodPut, "/admin/api/keys/"+itoa(mine.ID), user.Token, `{"rpm_limit":0}`)
+	if rec.Code != 400 {
+		t.Fatalf("zero rpm %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/accounts/"+itoa(admin.Account.ID)+"/credits", admin.Token, `{"delta":1}`)
+	if rec.Code != 200 {
+		t.Fatalf("admin credit %d %s", rec.Code, rec.Body.String())
+	}
 	rec = authJSON(h, http.MethodPost, "/admin/api/keys", admin.Token, `{"name":"other"}`)
 	if rec.Code != 201 {
 		t.Fatalf("admin key %d %s", rec.Code, rec.Body.String())
@@ -438,6 +484,28 @@ func TestRedeemCodes(t *testing.T) {
 	if bytes.Contains(rec.Body.Bytes(), []byte(batch.Codes[0])) {
 		t.Fatalf("plaintext leaked %s", rec.Body.String())
 	}
+
+	rec = authJSON(h, http.MethodGet, "/admin/api/ledger", user.Token, "")
+	if rec.Code != 200 {
+		t.Fatalf("user ledger %d %s", rec.Code, rec.Body.String())
+	}
+	var led struct {
+		Items []struct {
+			Reason   string  `json:"reason"`
+			DeltaUSD float64 `json:"delta_usd"`
+			Account  int64   `json:"account_id"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &led); err != nil {
+		t.Fatal(err)
+	}
+	if len(led.Items) != 1 || led.Items[0].Reason != "redeem" || led.Items[0].DeltaUSD != 5 || led.Items[0].Account != user.Account.ID {
+		t.Fatalf("ledger %+v", led.Items)
+	}
+	rec = authJSON(h, http.MethodGet, "/admin/api/ledger", admin.Token, "")
+	if rec.Code != 200 || !bytes.Contains(rec.Body.Bytes(), []byte(`"reason":"redeem"`)) {
+		t.Fatalf("admin ledger %d %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestPlaygroundSpendsAccountCredits(t *testing.T) {
@@ -504,8 +572,11 @@ func TestPlaygroundSpendsAccountCredits(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec = adminReq(h, http.MethodPost, "/admin/api/playground", body)
-	if rec.Code != 200 {
+	if rec.Code != 400 {
 		t.Fatalf("break-glass play %d %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("请登录后再试玩")) {
+		t.Fatalf("body %s", rec.Body.String())
 	}
 	after, err := st.GetAccount(context.Background(), user.Account.ID)
 	if err != nil {
@@ -517,13 +588,37 @@ func TestPlaygroundSpendsAccountCredits(t *testing.T) {
 }
 
 func TestPlaygroundValidatesBody(t *testing.T) {
-	s, _ := testServer(t, "http://127.0.0.1:1")
-	rec := adminReq(s.Handler(), http.MethodPost, "/admin/api/playground", `{"foo":1}`)
+	s, st := testServer(t, "http://127.0.0.1:1")
+	h := s.Handler()
+	rec := authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"bob","password":"password1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
+	}
+	var user struct {
+		Token   string `json:"token"`
+		Account struct {
+			ID int64 `json:"id"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &user); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AdjustCredits(context.Background(), user.Account.ID, store.CreditScale, true); err != nil {
+		t.Fatal(err)
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/playground", user.Token, `{"foo":1}`)
 	if rec.Code != 200 {
 		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
 	}
 	if !bytes.Contains(rec.Body.Bytes(), []byte(`"ok":false`)) {
 		t.Fatalf("body %s", rec.Body.String())
+	}
+	acc, err := st.GetAccount(context.Background(), user.Account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Credits != store.CreditScale {
+		t.Fatalf("invalid body billed, credits %d", acc.Credits)
 	}
 }
 
@@ -630,5 +725,80 @@ func TestAdminProxyCRUDAndBind(t *testing.T) {
 	_, err := st.GetProxy(context.Background(), created.ID)
 	if err != store.ErrNotFound {
 		t.Fatalf("deleted err %v", err)
+	}
+}
+
+func TestRegisterClosedPasswordAndDisable(t *testing.T) {
+	s, _ := testServer(t, "http://127.0.0.1:1")
+	s.cfg.OpenRegister = false
+	h := s.Handler()
+
+	rec := authJSON(h, http.MethodGet, "/admin/api/auth-info", "", "")
+	if rec.Code != 200 || !bytes.Contains(rec.Body.Bytes(), []byte(`"open_register":true`)) {
+		t.Fatalf("empty info %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"root","password":"password1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("first %d %s", rec.Code, rec.Body.String())
+	}
+	var admin struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &admin); err != nil {
+		t.Fatal(err)
+	}
+	rec = authJSON(h, http.MethodGet, "/admin/api/auth-info", "", "")
+	if rec.Code != 200 || !bytes.Contains(rec.Body.Bytes(), []byte(`"open_register":false`)) {
+		t.Fatalf("closed info %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"alice","password":"password1"}`)
+	if rec.Code != 403 {
+		t.Fatalf("second register %d %s", rec.Code, rec.Body.String())
+	}
+
+	s.cfg.OpenRegister = true
+	rec = authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"alice","password":"password1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("open register %d %s", rec.Code, rec.Body.String())
+	}
+	var user struct {
+		Token   string `json:"token"`
+		Account struct {
+			ID int64 `json:"id"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &user); err != nil {
+		t.Fatal(err)
+	}
+	rec = authJSON(h, http.MethodGet, "/admin/api/me", user.Token, "")
+	if rec.Code != 200 {
+		t.Fatalf("me %d", rec.Code)
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/password", user.Token, `{"old":"password1","new":"password2"}`)
+	if rec.Code != 200 {
+		t.Fatalf("password %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodGet, "/admin/api/me", user.Token, "")
+	if rec.Code != 401 {
+		t.Fatalf("old session %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/login", "", `{"username":"alice","password":"password2"}`)
+	if rec.Code != 200 {
+		t.Fatalf("relogin %d %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &user); err != nil {
+		t.Fatal(err)
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/accounts/"+itoa(user.Account.ID)+"/status", admin.Token, `{"status":"disabled"}`)
+	if rec.Code != 200 {
+		t.Fatalf("disable %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodGet, "/admin/api/me", user.Token, "")
+	if rec.Code != 401 {
+		t.Fatalf("disabled session %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/login", "", `{"username":"alice","password":"password2"}`)
+	if rec.Code != 401 {
+		t.Fatalf("disabled login %d %s", rec.Code, rec.Body.String())
 	}
 }

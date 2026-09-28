@@ -23,6 +23,10 @@ import (
 
 const maxBody = 8 << 20 // 8 MiB
 
+// holdMicro 是单次调用的预扣上限。请求体最多 8 MiB，按 1 token ≈ 4 字节估算，
+// 再留一倍余量。结算时按实际 input tokens 多退少补，余额不够预扣就直接拒绝。
+const holdMicro = int64(maxBody/4) * store.InputUSDPerTokenNum / store.InputUSDPerTokenDen * 2
+
 type Gateway struct {
 	Store    *store.Store
 	Pool     *pool.Pool
@@ -81,6 +85,7 @@ func (g *Gateway) Authenticate(r *http.Request) (store.UserKey, error) {
 		if errors.Is(err, store.ErrNotFound) {
 			return store.UserKey{}, errHTTP(401, "invalid_api_key", "invalid api key")
 		}
+		g.Log.Error("lookup user key", "err", err)
 		return store.UserKey{}, errHTTP(500, "internal_error", "lookup failed")
 	}
 	if !k.Active() {
@@ -92,6 +97,7 @@ func (g *Gateway) Authenticate(r *http.Request) (store.UserKey, error) {
 	if k.OwnerID != nil {
 		ok, err := g.Store.TrySpendCredits(r.Context(), *k.OwnerID, 0)
 		if err != nil {
+			g.Log.Error("credit check", "err", err)
 			return store.UserKey{}, errHTTP(500, "internal_error", "credit check failed")
 		}
 		if !ok {
@@ -148,6 +154,42 @@ func (g *Gateway) Evaluate(ctx context.Context, user *store.UserKey, body []byte
 	if user != nil {
 		userID = user.ID
 	}
+	var accountID int64
+	held := false
+	ref := requestID
+	if ref == "" {
+		ref = "usage"
+	}
+	if user != nil && user.OwnerID != nil {
+		accountID = *user.OwnerID
+		_, err := g.Store.PostCredit(ctx, accountID, -1, false, store.LedgerHold, ref, "", nil)
+		if errors.Is(err, store.ErrInsufficientCredits) {
+			he := errHTTP(402, "insufficient_credits", "积分不足")
+			return EvalResult{Status: 402, Err: he, Body: errorJSON(he)}
+		}
+		if err != nil {
+			g.Log.Error("credit hold", "err", err)
+			he := errHTTP(500, "internal_error", "credit check failed")
+			return EvalResult{Status: 500, Err: he, Body: errorJSON(he)}
+		}
+		held = true
+	}
+	var charged int64
+	settleOK := true
+	release := func(cost int64, callOK bool) {
+		if !held {
+			return
+		}
+		held = false
+		got, err := g.Store.SettleUsage(ctx, accountID, 1, cost, ref, callOK)
+		if err != nil {
+			settleOK = false
+			charged = 1
+			g.Log.Error("credit settle", "account", accountID, "cost", cost, "err", err)
+			return
+		}
+		charged = got
+	}
 
 	exclude := map[int64]struct{}{}
 	proxyExclude := map[int64]struct{}{}
@@ -158,10 +200,22 @@ func (g *Gateway) Evaluate(ctx context.Context, user *store.UserKey, body []byte
 		if err != nil {
 			if errors.Is(err, pool.ErrNoUpstream) {
 				he := errHTTP(503, "no_upstream", "no available upstream key")
-				g.logFailID(ctx, userID, nil, "", 0, 503, "no upstream", requestID)
+				release(0, false)
+				msg := "no upstream"
+				if !settleOK {
+					msg = "no upstream; credit hold not refunded"
+				}
+				g.logFailID(ctx, userID, nil, "", 0, 503, msg, requestID, accountID, charged)
 				return EvalResult{Status: 503, Err: he, Body: errorJSON(he)}
 			}
-			he := errHTTP(500, "internal_error", err.Error())
+			g.Log.Error("pick upstream", "err", err)
+			he := errHTTP(500, "internal_error", "internal error")
+			release(0, false)
+			msg := "internal error"
+			if !settleOK {
+				msg = "internal error; credit hold not refunded"
+			}
+			g.logFailID(ctx, userID, nil, "", 0, 500, msg, requestID, accountID, charged)
 			return EvalResult{Status: 500, Err: he, Body: errorJSON(he)}
 		}
 		if ok, wait := g.Limit.Allow(fmt.Sprintf("up:%d", sel.Up.ID), sel.Up.RPMLimit); !ok {
@@ -216,18 +270,13 @@ func (g *Gateway) Evaluate(ctx context.Context, user *store.UserKey, body []byte
 		ok := status >= 200 && status < 300
 		if ok {
 			g.Pool.MarkOK(ctx, upID)
-			if user != nil {
+			if user != nil && user.ID > 0 {
 				_ = g.Store.AddTokens(ctx, user.ID, inTok)
-				if user.OwnerID != nil && inTok > 0 {
-					cost := (inTok*store.InputUSDPerTokenNum + store.InputUSDPerTokenDen/2) / store.InputUSDPerTokenDen
-					if cost < 1 {
-						cost = 1
-					}
-					if spent, err := g.Store.TrySpendCredits(ctx, *user.OwnerID, cost); err != nil || !spent {
-						g.Log.Warn("credit spend", "account", *user.OwnerID, "cost", cost, "spent", spent, "err", err)
-					}
-				}
 			}
+			release(store.UsageCost(inTok), true)
+		}
+		if !ok {
+			release(0, false)
 		}
 		_ = g.Store.InsertLog(ctx, store.UsageLog{
 			UserKeyID:    userID,
@@ -240,6 +289,8 @@ func (g *Gateway) Evaluate(ctx context.Context, user *store.UserKey, body []byte
 			OK:           ok,
 			Error:        ifNotOK(ok, snippet(respBody)),
 			RequestID:    requestID,
+			CreditMicro:  charged,
+			AccountID:    accountID,
 		})
 		return EvalResult{
 			Status: status, Header: hdr, Body: respBody, LatencyMS: lat,
@@ -250,7 +301,12 @@ func (g *Gateway) Evaluate(ctx context.Context, user *store.UserKey, body []byte
 	if last.code == 0 {
 		last = errHTTP(502, "upstream_error", "all upstream attempts failed")
 	}
-	g.logFailID(ctx, userID, nil, modelOf(body), 0, last.code, last.msg, requestID)
+	release(0, false)
+	msg := last.msg
+	if !settleOK {
+		msg = msg + "; credit hold not refunded"
+	}
+	g.logFailID(ctx, userID, nil, modelOf(body), 0, last.code, msg, requestID, accountID, charged)
 	return EvalResult{Status: last.code, Err: last, Body: errorJSON(last)}
 }
 
@@ -264,7 +320,7 @@ func ifNotOK(ok bool, s string) string {
 func errorJSON(err error) []byte {
 	he, ok := IsHTTPErr(err)
 	if !ok {
-		he = errHTTP(500, "internal_error", err.Error())
+		he = errHTTP(500, "internal_error", "internal error")
 	}
 	b, _ := json.Marshal(map[string]any{"error": map[string]any{"type": he.kind, "message": he.msg}})
 	return append(b, '\n')
@@ -297,7 +353,8 @@ func (g *Gateway) Models(w http.ResponseWriter, r *http.Request, user store.User
 				writeJSON(w, 200, catalogFallback())
 				return
 			}
-			writeErr(w, errHTTP(500, "internal_error", err.Error()))
+			g.Log.Error("pick upstream", "err", err)
+			writeErr(w, errHTTP(500, "internal_error", "internal error"))
 			return
 		}
 		choice, perr := g.pickExit(r.Context(), sel.Up, proxyExclude)
@@ -401,7 +458,16 @@ func (g *Gateway) pickExit(ctx context.Context, up store.Upstream, exclude map[i
 	if g.Picker == nil {
 		return outproxy.Choice{Direct: true}, nil
 	}
-	return g.Picker.Pick(ctx, up, exclude)
+	choice, err := g.Picker.Pick(ctx, up, exclude)
+	if err != nil || choice.Proxy == nil || g.Pool == nil {
+		return choice, err
+	}
+	opened, err := g.Pool.OpenProxy(*choice.Proxy)
+	if err != nil {
+		return outproxy.Choice{}, err
+	}
+	choice.Proxy = &opened
+	return choice, nil
 }
 
 func (g *Gateway) markProxyTransportErr(ctx context.Context, choice outproxy.Choice, err error) {
@@ -476,20 +542,18 @@ func (g *Gateway) copyUpstream(w http.ResponseWriter, status int, hdr http.Heade
 	_, _ = w.Write(body)
 }
 
-func (g *Gateway) logFail(ctx context.Context, user store.UserKey, up *int64, model string, lat int64, status int, msg, rid string) {
-	g.logFailID(ctx, user.ID, up, model, lat, status, msg, rid)
-}
-
-func (g *Gateway) logFailID(ctx context.Context, userID int64, up *int64, model string, lat int64, status int, msg, rid string) {
+func (g *Gateway) logFailID(ctx context.Context, userID int64, up *int64, model string, lat int64, status int, msg, rid string, accountID, creditMicro int64) {
 	_ = g.Store.InsertLog(ctx, store.UsageLog{
-		UserKeyID:  userID,
-		UpstreamID: up,
-		Model:      model,
-		LatencyMS:  lat,
-		StatusCode: status,
-		OK:         false,
-		Error:      msg,
-		RequestID:  rid,
+		UserKeyID:   userID,
+		UpstreamID:  up,
+		Model:       model,
+		LatencyMS:   lat,
+		StatusCode:  status,
+		OK:          false,
+		Error:       msg,
+		RequestID:   rid,
+		AccountID:   accountID,
+		CreditMicro: creditMicro,
 	})
 }
 
@@ -550,7 +614,7 @@ func errHTTP(code int, kind, msg string) httpErr {
 func writeErr(w http.ResponseWriter, err error) {
 	var he httpErr
 	if !errors.As(err, &he) {
-		he = errHTTP(500, "internal_error", err.Error())
+		he = errHTTP(500, "internal_error", "internal error")
 	}
 	if he.retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(he.retryAfter))

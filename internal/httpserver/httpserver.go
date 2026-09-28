@@ -15,7 +15,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
@@ -37,9 +36,10 @@ type Server struct {
 }
 
 type Config struct {
-	Listen     string
-	AdminToken string
-	Debug      bool
+	Listen       string
+	AdminToken   string
+	Debug        bool
+	OpenRegister bool
 }
 
 func New(cfg Config, st *store.Store, box *cryptox.AESGCM, p *pool.Pool, gw *proxy.Gateway, log *slog.Logger) *Server {
@@ -54,14 +54,6 @@ func (s *Server) Handler() http.Handler {
 	r.Use(gin.Recovery())
 	r.Use(s.requestID())
 	r.Use(s.accessLog())
-	r.Use(cors.New(cors.Config{
-		AllowAllOrigins:  true,
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Request-Id", "X-Admin-Token"},
-		ExposeHeaders:    []string{"X-Request-Id", "Retry-After"},
-		AllowCredentials: false,
-		MaxAge:           12 * time.Hour,
-	}))
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(200, gin.H{"ok": true})
@@ -71,12 +63,14 @@ func (s *Server) Handler() http.Handler {
 	v1.POST("/systemone", s.handleSystemOne)
 	v1.GET("/models", s.handleModels)
 
+	r.GET("/admin/api/auth-info", s.authInfo)
 	r.POST("/admin/api/register", s.register)
 	r.POST("/admin/api/login", s.login)
 
 	authed := r.Group("/admin/api")
 	authed.Use(s.requireAccount())
 	authed.POST("/logout", s.logout)
+	authed.POST("/password", s.changePassword)
 	authed.GET("/me", s.me)
 	authed.GET("/stats", s.adminStats)
 	authed.GET("/keys", s.adminListKeys)
@@ -86,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 	authed.POST("/keys/:id/reset-usage", s.adminResetKeyUsage)
 	authed.GET("/logs", s.adminLogs)
 	authed.GET("/credits", s.myCredits)
+	authed.GET("/ledger", s.myLedger)
 	authed.POST("/redeem", s.redeemCode)
 	authed.POST("/playground", s.adminPlayground)
 
@@ -106,7 +101,9 @@ func (s *Server) Handler() http.Handler {
 	admin.DELETE("/proxies/:id", s.adminDeleteProxy)
 	admin.POST("/proxies/:id/probe", s.adminProbeProxy)
 	admin.GET("/accounts", s.adminListAccounts)
+	admin.POST("/accounts/:id/status", s.adminSetAccountStatus)
 	admin.POST("/accounts/:id/credits", s.adminAdjustCredits)
+	admin.GET("/accounts/:id/ledger", s.adminListLedger)
 	admin.GET("/redeem-codes", s.adminListRedeemCodes)
 	admin.POST("/redeem-codes", s.adminCreateRedeemCodes)
 
@@ -248,7 +245,33 @@ func validUsername(name string) bool {
 	return true
 }
 
+func (s *Server) authInfo(c *gin.Context) {
+	n, err := s.store.CountAccounts(c.Request.Context())
+	if err != nil {
+		s.fail(c, 500, "internal error")
+		return
+	}
+	c.JSON(200, gin.H{"open_register": s.cfg.OpenRegister || n == 0})
+}
+
+func (s *Server) allowAuth(c *gin.Context, kind string, limit int) bool {
+	ip := c.ClientIP()
+	if ip == "" {
+		ip = "unknown"
+	}
+	ok, wait := s.gw.Limit.AllowWindow("auth:"+kind+":"+ip, limit, time.Hour)
+	if ok {
+		return true
+	}
+	c.Header("Retry-After", strconv.Itoa(int(wait.Seconds())))
+	s.fail(c, 429, "尝试过于频繁，请稍后再试")
+	return false
+}
+
 func (s *Server) register(c *gin.Context) {
+	if !s.allowAuth(c, "register", 5) {
+		return
+	}
 	var req authReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		s.fail(c, 400, "invalid json")
@@ -266,36 +289,48 @@ func (s *Server) register(c *gin.Context) {
 	}
 	hash, err := cryptox.HashPassword(pass)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
-	role := store.RoleUser
 	n, err := s.store.CountAccounts(c.Request.Context())
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("count accounts", "err", err)
 		return
 	}
-	if n == 0 {
-		role = store.RoleAdmin
+	if n > 0 && !s.cfg.OpenRegister {
+		s.fail(c, 403, "注册已关闭")
+		return
 	}
-	id, err := s.store.InsertAccount(c.Request.Context(), name, hash, role)
+	var id int64
+	if n == 0 {
+		id, err = s.store.InsertBootstrapAccount(c.Request.Context(), name, hash)
+	} else {
+		id, err = s.store.InsertAccount(c.Request.Context(), name, hash, store.RoleUser)
+	}
 	if errors.Is(err, store.ErrConflict) {
 		s.fail(c, 409, "用户名已存在")
 		return
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	tok, acc, err := s.issueSession(c, id)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(201, gin.H{"token": tok, "account": accountDTO(acc)})
 }
 
 func (s *Server) login(c *gin.Context) {
+	if !s.allowAuth(c, "login", 10) {
+		return
+	}
 	var req authReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		s.fail(c, 400, "invalid json")
@@ -308,10 +343,88 @@ func (s *Server) login(c *gin.Context) {
 	}
 	tok, acc, err := s.issueSession(c, acc.ID)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(200, gin.H{"token": tok, "account": accountDTO(acc)})
+}
+
+func (s *Server) changePassword(c *gin.Context) {
+	if c.GetBool("break_glass") {
+		s.fail(c, 400, "应急口令没有密码可改")
+		return
+	}
+	acc, ok := s.currentAccount(c)
+	if !ok {
+		s.fail(c, 401, "login required")
+		return
+	}
+	var req struct {
+		Old string `json:"old"`
+		New string `json:"new"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.fail(c, 400, "invalid json")
+		return
+	}
+	if !cryptox.CheckPassword(acc.PasswordHash, req.Old) {
+		s.fail(c, 401, "原密码错误")
+		return
+	}
+	if utf8.RuneCountInString(req.New) < 8 || len(req.New) > 128 {
+		s.fail(c, 400, "密码至少 8 位")
+		return
+	}
+	if req.New == req.Old {
+		s.fail(c, 400, "新密码不能与原密码相同")
+		return
+	}
+	hash, err := cryptox.HashPassword(req.New)
+	if err != nil {
+		s.fail(c, 500, "internal error")
+		s.log.Error("hash password", "err", err)
+		return
+	}
+	if err := s.store.UpdatePassword(c.Request.Context(), acc.ID, hash); err != nil {
+		s.fail(c, 500, "internal error")
+		s.log.Error("update password", "err", err)
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+func (s *Server) adminSetAccountStatus(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		s.fail(c, 400, "bad id")
+		return
+	}
+	var req struct {
+		Status string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.fail(c, 400, "invalid json")
+		return
+	}
+	if req.Status != "active" && req.Status != "disabled" {
+		s.fail(c, 400, "status 只能是 active 或 disabled")
+		return
+	}
+	if acc, ok := s.currentAccount(c); ok && acc.ID == id && req.Status != "active" {
+		s.fail(c, 400, "不能停用自己")
+		return
+	}
+	if err := s.store.SetAccountStatus(c.Request.Context(), id, req.Status); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.fail(c, 404, "not found")
+			return
+		}
+		s.fail(c, 500, "internal error")
+		s.log.Error("account status", "err", err)
+		return
+	}
+	c.JSON(200, gin.H{"id": id, "status": req.Status})
 }
 
 func (s *Server) logout(c *gin.Context) {
@@ -353,7 +466,7 @@ func (s *Server) issueSession(c *gin.Context, accountID int64) (string, store.Ac
 
 func accountDTO(a store.Account) gin.H {
 	return gin.H{
-		"id": a.ID, "username": a.Username, "role": a.Role,
+		"id": a.ID, "username": a.Username, "role": a.Role, "status": a.Status,
 		"credits": a.Credits, "credits_usd": float64(a.Credits) / float64(store.CreditScale),
 	}
 }
@@ -389,7 +502,8 @@ func (s *Server) adminStats(c *gin.Context) {
 		st, err = s.store.Stats(c.Request.Context())
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(200, st)
@@ -430,12 +544,14 @@ func toUpstreamDTO(u store.Upstream) upstreamDTO {
 func (s *Server) adminListUpstreams(c *gin.Context) {
 	items, err := s.store.ListUpstreams(c.Request.Context())
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	usage, err := s.store.UpstreamUsage(c.Request.Context())
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	out := make([]upstreamDTO, 0, len(items))
@@ -492,7 +608,8 @@ func (s *Server) adminCreateUpstream(c *gin.Context) {
 			s.fail(c, 409, "upstream key already imported")
 			return
 		}
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(201, toUpstreamDTO(u))
@@ -537,7 +654,8 @@ func (s *Server) adminUpdateUpstream(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	var req upstreamReq
@@ -569,7 +687,8 @@ func (s *Server) adminUpdateUpstream(c *gin.Context) {
 		}
 		enc, err = s.box.Encrypt([]byte(k))
 		if err != nil {
-			s.fail(c, 500, err.Error())
+			s.fail(c, 500, "internal error")
+			s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 			return
 		}
 		prefix, last4 = store.PrefixLast4(k)
@@ -586,7 +705,8 @@ func (s *Server) adminUpdateUpstream(c *gin.Context) {
 		setProxy = true
 	}
 	if err := s.store.UpdateUpstream(c.Request.Context(), id, name, weight, rpm, status, enc, prefix, last4, hash, proxyID, setProxy); err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	u, _ := s.store.GetUpstream(c.Request.Context(), id)
@@ -604,7 +724,8 @@ func (s *Server) adminDeleteUpstream(c *gin.Context) {
 			s.fail(c, 404, "not found")
 			return
 		}
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(200, gin.H{"ok": true})
@@ -622,12 +743,14 @@ func (s *Server) adminProbeUpstream(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	key, err := s.pool.Decrypt(u)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 12*time.Second)
@@ -701,12 +824,14 @@ func (s *Server) adminListKeys(c *gin.Context) {
 		items, err = s.store.ListUserKeys(c.Request.Context())
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	credits, err := s.ownerCredits(c.Request.Context(), items)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	out := make([]userKeyDTO, 0, len(items))
@@ -744,6 +869,7 @@ type keyReq struct {
 	Status     string  `json:"status"`
 	Note       *string `json:"note"`
 	ExpiresAt  *int64  `json:"expires_at"`
+	OwnerID    *int64  `json:"owner_id"`
 }
 
 func (s *Server) adminCreateKey(c *gin.Context) {
@@ -754,7 +880,8 @@ func (s *Server) adminCreateKey(c *gin.Context) {
 	}
 	body, err := cryptox.RandomString(40)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	plain := "sk-jev-" + body
@@ -767,9 +894,17 @@ func (s *Server) adminCreateKey(c *gin.Context) {
 	if req.RPMLimit != nil {
 		rpm = *req.RPMLimit
 	}
+	if rpm < 1 || rpm > 100000 {
+		s.fail(c, 400, "RPM 须为 1 到 100000")
+		return
+	}
 	var quota int64
 	if req.TokenQuota != nil {
 		quota = *req.TokenQuota
+	}
+	if quota < 0 {
+		s.fail(c, 400, "token 配额不能为负")
+		return
 	}
 	note := ""
 	if req.Note != nil {
@@ -779,23 +914,43 @@ func (s *Server) adminCreateKey(c *gin.Context) {
 		Name: name, KeyHash: cryptox.HashAPIKey(plain), KeyPrefix: prefix, KeyLast4: last4,
 		RPMLimit: rpm, TokenQuota: quota, Status: "active", Note: note, ExpiresAt: req.ExpiresAt,
 	}
-	if acc, ok := s.currentAccount(c); ok {
-		owner := acc.ID
-		uk.OwnerID = &owner
-		if !s.isAdmin(c) {
-			if acc.Credits <= 0 {
-				s.fail(c, 402, "积分不足，无法创建 Key")
-				return
-			}
-			uk.TokenQuota = 0
-			if uk.RPMLimit <= 0 || uk.RPMLimit > 120 {
-				uk.RPMLimit = 60
-			}
+	ownerID := int64(0)
+	if acc, ok := s.currentAccount(c); ok && !s.isAdmin(c) {
+		ownerID = acc.ID
+	} else if req.OwnerID != nil && *req.OwnerID > 0 {
+		ownerID = *req.OwnerID
+	} else if acc, ok := s.currentAccount(c); ok {
+		ownerID = acc.ID
+	}
+	if ownerID == 0 {
+		s.fail(c, 400, "请指定归属账号")
+		return
+	}
+	owner, err := s.store.GetAccount(c.Request.Context(), ownerID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.fail(c, 500, "internal error")
+		s.log.Error("key owner", "err", err)
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) || owner.Status != "active" {
+		s.fail(c, 400, "归属账号不存在或已停用")
+		return
+	}
+	if owner.Credits <= 0 {
+		s.fail(c, 402, "积分不足，无法创建 Key")
+		return
+	}
+	uk.OwnerID = &ownerID
+	if !s.isAdmin(c) {
+		uk.TokenQuota = 0
+		if uk.RPMLimit <= 0 || uk.RPMLimit > 120 {
+			uk.RPMLimit = 60
 		}
 	}
 	id, err := s.store.InsertUserKey(c.Request.Context(), uk)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	k, _ := s.store.GetUserKey(c.Request.Context(), id)
@@ -817,16 +972,17 @@ func (s *Server) adminUpdateKey(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
+	userEdit := false
 	if acc, ok := s.currentAccount(c); ok && !s.isAdmin(c) {
 		if cur.OwnerID == nil || *cur.OwnerID != acc.ID {
 			s.fail(c, 404, "not found")
 			return
 		}
-		s.fail(c, 403, "admin only")
-		return
+		userEdit = true
 	}
 	var req keyReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -845,9 +1001,17 @@ func (s *Server) adminUpdateKey(c *gin.Context) {
 	if req.RPMLimit != nil {
 		rpm = *req.RPMLimit
 	}
+	if rpm < 1 || rpm > 100000 {
+		s.fail(c, 400, "RPM 须为 1 到 100000")
+		return
+	}
 	quota := cur.TokenQuota
 	if req.TokenQuota != nil {
 		quota = *req.TokenQuota
+	}
+	if quota < 0 {
+		s.fail(c, 400, "token 配额不能为负")
+		return
 	}
 	note := cur.Note
 	if req.Note != nil {
@@ -857,8 +1021,21 @@ func (s *Server) adminUpdateKey(c *gin.Context) {
 	if req.ExpiresAt != nil {
 		exp = req.ExpiresAt
 	}
+	if userEdit {
+		name = cur.Name
+		status = cur.Status
+		quota = cur.TokenQuota
+		note = cur.Note
+		exp = cur.ExpiresAt
+		if req.RPMLimit == nil || *req.RPMLimit < 1 || *req.RPMLimit > 120 {
+			s.fail(c, 400, "RPM 须为 1 到 120")
+			return
+		}
+		rpm = *req.RPMLimit
+	}
 	if err := s.store.UpdateUserKey(c.Request.Context(), id, name, rpm, quota, status, exp, note); err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	k, _ := s.store.GetUserKey(c.Request.Context(), id)
@@ -878,7 +1055,8 @@ func (s *Server) adminDeleteKey(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	if acc, ok := s.currentAccount(c); ok && !s.isAdmin(c) {
@@ -892,7 +1070,8 @@ func (s *Server) adminDeleteKey(c *gin.Context) {
 			s.fail(c, 404, "not found")
 			return
 		}
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(200, gin.H{"ok": true})
@@ -913,7 +1092,8 @@ func (s *Server) adminResetKeyUsage(c *gin.Context) {
 			s.fail(c, 404, "not found")
 			return
 		}
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	k, _ := s.store.GetUserKey(c.Request.Context(), id)
@@ -948,10 +1128,49 @@ func (s *Server) adminLogs(c *gin.Context) {
 	}
 	items, total, err := s.store.ListLogs(c.Request.Context(), f)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
-	c.JSON(200, gin.H{"items": items, "total": total, "limit": f.Limit, "offset": f.Offset})
+	names, err := s.logAccountNames(c.Request.Context(), items)
+	if err != nil {
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
+		return
+	}
+	out := make([]gin.H, 0, len(items))
+	for _, it := range items {
+		out = append(out, gin.H{
+			"id": it.ID, "user_key_id": it.UserKeyID, "upstream_id": it.UpstreamID,
+			"model": it.Model, "input_tokens": it.InputTokens, "output_tokens": it.OutputTokens,
+			"latency_ms": it.LatencyMS, "status_code": it.StatusCode, "ok": it.OK,
+			"error": it.Error, "request_id": it.RequestID, "created_at": it.CreatedAt,
+			"credit_micro": it.CreditMicro, "account_id": it.AccountID,
+			"account_name": names[it.AccountID],
+		})
+	}
+	c.JSON(200, gin.H{"items": out, "total": total, "limit": f.Limit, "offset": f.Offset})
+}
+
+func (s *Server) logAccountNames(ctx context.Context, items []store.UsageLog) (map[int64]string, error) {
+	names := map[int64]string{}
+	for _, it := range items {
+		if it.AccountID <= 0 {
+			continue
+		}
+		if _, ok := names[it.AccountID]; ok {
+			continue
+		}
+		acc, err := s.store.GetAccount(ctx, it.AccountID)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		names[acc.ID] = acc.Username
+	}
+	return names, nil
 }
 
 type importReq struct {
@@ -980,7 +1199,8 @@ func (s *Server) adminImportUpstreams(c *gin.Context) {
 				skipped++
 				continue
 			}
-			s.fail(c, 500, err.Error())
+			s.fail(c, 500, "internal error")
+			s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 			return
 		}
 		items = append(items, toUpstreamDTO(u))
@@ -992,7 +1212,8 @@ func (s *Server) adminImportUpstreams(c *gin.Context) {
 func (s *Server) adminProbeAll(c *gin.Context) {
 	items, err := s.store.ListUpstreams(c.Request.Context())
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	type probeOne struct {
@@ -1039,21 +1260,28 @@ func (s *Server) adminPlayground(c *gin.Context) {
 		s.fail(c, 400, "read body failed")
 		return
 	}
-	var user *store.UserKey
-	if acc, ok := s.currentAccount(c); ok {
-		enough, err := s.store.TrySpendCredits(c.Request.Context(), acc.ID, 0)
-		if err != nil {
-			s.fail(c, 500, err.Error())
-			return
-		}
-		if !enough {
-			s.fail(c, 402, "积分不足")
-			return
-		}
-		owner := acc.ID
-		user = &store.UserKey{OwnerID: &owner}
+	acc, ok := s.currentAccount(c)
+	if !ok {
+		s.fail(c, 400, "应急口令没有账号，请登录后再试玩")
+		return
 	}
+	enough, err := s.store.TrySpendCredits(c.Request.Context(), acc.ID, 0)
+	if err != nil {
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
+		return
+	}
+	if !enough {
+		s.fail(c, 402, "积分不足")
+		return
+	}
+	owner := acc.ID
+	user := &store.UserKey{OwnerID: &owner}
 	res := s.gw.Evaluate(c.Request.Context(), user, body, c.GetString("request_id"))
+	if res.Status == 402 {
+		s.fail(c, 402, "积分不足")
+		return
+	}
 	status := res.Status
 	if status == 0 {
 		status = 502
@@ -1076,7 +1304,6 @@ func (s *Server) adminPlayground(c *gin.Context) {
 		"upstream_id":   res.UpstreamID,
 		"error":         errMsg,
 		"body":          parsed,
-		"raw":           string(res.Body),
 	})
 }
 
@@ -1176,7 +1403,8 @@ func (s *Server) validatedProxyID(c *gin.Context, opt optionalInt64) (*int64, er
 			s.fail(c, 400, "proxy not found")
 			return nil, err
 		}
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return nil, err
 	}
 	return &id, nil
@@ -1211,6 +1439,48 @@ func errString(err error) string {
 	return err.Error()
 }
 
+func (s *Server) myLedger(c *gin.Context) {
+	if c.GetBool("break_glass") || s.isAdmin(c) {
+		s.writeLedger(c, 0)
+		return
+	}
+	acc, ok := s.currentAccount(c)
+	if !ok {
+		s.fail(c, 401, "login required")
+		return
+	}
+	s.writeLedger(c, acc.ID)
+}
+
+func (s *Server) adminListLedger(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		s.fail(c, 400, "bad id")
+		return
+	}
+	s.writeLedger(c, id)
+}
+
+func (s *Server) writeLedger(c *gin.Context, accountID int64) {
+	items, err := s.store.ListCreditLedger(c.Request.Context(), accountID, 50)
+	if err != nil {
+		s.fail(c, 500, "internal error")
+		s.log.Error("ledger", "err", err)
+		return
+	}
+	out := make([]gin.H, 0, len(items))
+	for _, it := range items {
+		out = append(out, gin.H{
+			"id": it.ID, "account_id": it.AccountID, "delta": it.Delta,
+			"delta_usd": float64(it.Delta) / float64(store.CreditScale),
+			"balance":   it.Balance, "balance_usd": float64(it.Balance) / float64(store.CreditScale),
+			"reason": it.Reason, "ref": it.Ref, "note": it.Note,
+			"actor_id": it.ActorID, "created_at": it.CreatedAt,
+		})
+	}
+	c.JSON(200, gin.H{"items": out})
+}
+
 func (s *Server) myCredits(c *gin.Context) {
 	if c.GetBool("break_glass") {
 		c.JSON(200, gin.H{"credits": int64(0), "credits_usd": 0, "break_glass": true})
@@ -1223,7 +1493,8 @@ func (s *Server) myCredits(c *gin.Context) {
 	}
 	fresh, err := s.store.GetAccount(c.Request.Context(), acc.ID)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(200, gin.H{"credits": fresh.Credits, "credits_usd": float64(fresh.Credits) / float64(store.CreditScale)})
@@ -1232,7 +1503,8 @@ func (s *Server) myCredits(c *gin.Context) {
 func (s *Server) adminListAccounts(c *gin.Context) {
 	items, err := s.store.ListAccounts(c.Request.Context())
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	out := make([]gin.H, 0, len(items))
@@ -1258,19 +1530,25 @@ func (s *Server) adminAdjustCredits(c *gin.Context) {
 		s.fail(c, 400, "invalid json")
 		return
 	}
-	if req.Delta == 0 {
-		s.fail(c, 400, "delta 不能为 0")
+	if req.Delta == 0 || req.Delta > 1_000_000 || req.Delta < -1_000_000 {
+		s.fail(c, 400, "调整额度须为 -1000000 到 1000000 之间的非 0 整数")
 		return
 	}
 	// delta 单位是积分（美元），内部用微积分。
 	micro := req.Delta * store.CreditScale
-	next, err := s.store.AdjustCredits(c.Request.Context(), id, micro, true)
+	var actorID *int64
+	if acc, ok := s.currentAccount(c); ok {
+		a := acc.ID
+		actorID = &a
+	}
+	next, err := s.store.PostCredit(c.Request.Context(), id, micro, true, store.LedgerAdjust, "", clip(strings.TrimSpace(req.Note), 200), actorID)
 	if errors.Is(err, store.ErrNotFound) {
 		s.fail(c, 404, "not found")
 		return
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	s.log.Info("credits adjusted", "account", id, "delta", req.Delta, "note", req.Note, "credits", next)
@@ -1278,6 +1556,9 @@ func (s *Server) adminAdjustCredits(c *gin.Context) {
 }
 
 func (s *Server) redeemCode(c *gin.Context) {
+	if !s.allowAuth(c, "redeem", 8) {
+		return
+	}
 	if c.GetBool("break_glass") {
 		s.fail(c, 400, "应急口令没有账号，不能兑换积分")
 		return
@@ -1309,7 +1590,8 @@ func (s *Server) redeemCode(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(200, gin.H{
@@ -1350,7 +1632,8 @@ func (s *Server) adminCreateRedeemCodes(c *gin.Context) {
 	for len(plains) < req.Count {
 		plain, err := newRedeemCode()
 		if err != nil {
-			s.fail(c, 500, err.Error())
+			s.fail(c, 500, "internal error")
+			s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 			return
 		}
 		if _, ok := seen[plain]; ok {
@@ -1364,7 +1647,8 @@ func (s *Server) adminCreateRedeemCodes(c *gin.Context) {
 		})
 	}
 	if err := s.store.InsertRedeemCodes(c.Request.Context(), items); err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(201, gin.H{"credits": req.Credits, "note": note, "codes": plains})
@@ -1373,7 +1657,8 @@ func (s *Server) adminCreateRedeemCodes(c *gin.Context) {
 func (s *Server) adminListRedeemCodes(c *gin.Context) {
 	items, err := s.store.ListRedeemCodes(c.Request.Context(), 100)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	out := make([]gin.H, 0, len(items))

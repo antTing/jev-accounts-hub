@@ -35,7 +35,8 @@ func (o *optionalInt64) UnmarshalJSON(b []byte) error {
 func (s *Server) adminListProxies(c *gin.Context) {
 	items, err := s.store.ListProxies(c.Request.Context())
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	out := make([]proxyDTO, 0, len(items))
@@ -68,9 +69,11 @@ type proxyDTO struct {
 }
 
 func toProxyDTO(p store.Proxy) proxyDTO {
+	shown := p
+	shown.Password = ""
 	return proxyDTO{
 		ID: p.ID, Name: p.Name, Protocol: p.Protocol, Host: p.Host, Port: p.Port,
-		Username: p.Username, HasPassword: p.Password != "", URL: outproxy.Redacted(p),
+		Username: p.Username, HasPassword: len(p.PasswordEnc) > 0 || p.Password != "", URL: outproxy.Redacted(shown),
 		Status: p.Status, FailCount: p.FailCount, CooldownUntil: p.CooldownUntil,
 		LastOKAt: p.LastOKAt, LastErrAt: p.LastErrAt, LastErr: p.LastErr,
 		LastIP: p.LastIP, LastCountry: p.LastCountry, LastLatencyMS: p.LastLatencyMS,
@@ -99,6 +102,7 @@ func (s *Server) parseProxyReq(req proxyReq, cur *store.Proxy) (store.Proxy, err
 		p = parsed
 	} else if cur != nil {
 		p = *cur
+		p.Password = ""
 		if req.Protocol != "" {
 			p.Protocol = req.Protocol
 		}
@@ -113,6 +117,7 @@ func (s *Server) parseProxyReq(req proxyReq, cur *store.Proxy) (store.Proxy, err
 		}
 		if req.Password != "" {
 			p.Password = req.Password
+			p.PasswordEnc = nil
 		}
 	} else {
 		p = store.Proxy{
@@ -135,6 +140,14 @@ func (s *Server) parseProxyReq(req proxyReq, cur *store.Proxy) (store.Proxy, err
 	return p, nil
 }
 
+func (s *Server) sealProxyPassword(plain string) ([]byte, error) {
+	if plain == "" {
+		return []byte{}, nil
+	}
+	return s.box.Encrypt([]byte(plain))
+}
+
+
 func (s *Server) adminCreateProxy(c *gin.Context) {
 	var req proxyReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -146,18 +159,28 @@ func (s *Server) adminCreateProxy(c *gin.Context) {
 		s.fail(c, 400, err.Error())
 		return
 	}
+	enc, err := s.sealProxyPassword(p.Password)
+	if err != nil {
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
+		return
+	}
+	p.Password = ""
+	p.PasswordEnc = enc
 	id, err := s.store.InsertProxy(c.Request.Context(), p)
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			s.fail(c, 409, "proxy already exists")
 			return
 		}
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	got, err := s.store.GetProxy(c.Request.Context(), id)
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(201, toProxyDTO(got))
@@ -175,7 +198,8 @@ func (s *Server) adminUpdateProxy(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	var req proxyReq
@@ -188,12 +212,22 @@ func (s *Server) adminUpdateProxy(c *gin.Context) {
 		s.fail(c, 400, err.Error())
 		return
 	}
-	if err := s.store.UpdateProxy(c.Request.Context(), id, p.Name, p.Protocol, p.Host, p.Port, p.Username, p.Password, p.Status); err != nil {
+	enc := p.PasswordEnc
+	if p.Password != "" || len(enc) == 0 {
+		enc, err = s.sealProxyPassword(p.Password)
+		if err != nil {
+			s.fail(c, 500, "internal error")
+			s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
+			return
+		}
+	}
+	if err := s.store.UpdateProxy(c.Request.Context(), id, p.Name, p.Protocol, p.Host, p.Port, p.Username, enc, p.Status); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			s.fail(c, 409, "proxy already exists")
 			return
 		}
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	got, _ := s.store.GetProxy(c.Request.Context(), id)
@@ -211,7 +245,8 @@ func (s *Server) adminDeleteProxy(c *gin.Context) {
 			s.fail(c, 404, "not found")
 			return
 		}
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
 	c.JSON(200, gin.H{"ok": true})
@@ -229,10 +264,17 @@ func (s *Server) adminProbeProxy(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		s.fail(c, 500, err.Error())
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 		return
 	}
-	res := outproxy.Probe(c.Request.Context(), p, 10*time.Second)
+	opened, err := s.pool.OpenProxy(p)
+	if err != nil {
+		s.fail(c, 500, "internal error")
+		s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
+		return
+	}
+	res := outproxy.Probe(c.Request.Context(), opened, 10*time.Second)
 	if res.OK {
 		_ = s.store.TouchProxyOK(c.Request.Context(), id, res.IP, res.Country, res.LatencyMS)
 	} else {
@@ -273,13 +315,22 @@ func (s *Server) adminImportProxies(c *gin.Context) {
 			}
 			continue
 		}
+		enc, err := s.sealProxyPassword(p.Password)
+		if err != nil {
+			s.fail(c, 500, "internal error")
+			s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
+			return
+		}
+		p.Password = ""
+		p.PasswordEnc = enc
 		id, err := s.store.InsertProxy(c.Request.Context(), p)
 		if err != nil {
 			if errors.Is(err, store.ErrConflict) {
 				skipped++
 				continue
 			}
-			s.fail(c, 500, err.Error())
+			s.fail(c, 500, "internal error")
+			s.log.Error("request failed", "op", c.Request.Method+" "+c.FullPath(), "err", err)
 			return
 		}
 		got, _ := s.store.GetProxy(c.Request.Context(), id)

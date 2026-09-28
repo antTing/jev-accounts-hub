@@ -92,7 +92,9 @@ CREATE TABLE IF NOT EXISTS usage_logs (
   ok INTEGER NOT NULL,
   error TEXT,
   request_id TEXT,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  credit_micro INTEGER NOT NULL DEFAULT 0,
+  account_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_logs(user_key_id, created_at DESC);
@@ -105,6 +107,7 @@ CREATE TABLE IF NOT EXISTS proxies (
   port INTEGER NOT NULL,
   username TEXT NOT NULL DEFAULT '',
   password TEXT NOT NULL DEFAULT '',
+  password_enc BLOB NOT NULL DEFAULT X'',
   status TEXT NOT NULL DEFAULT 'active',
   fail_count INTEGER NOT NULL DEFAULT 0,
   cooldown_until INTEGER NOT NULL DEFAULT 0,
@@ -151,6 +154,19 @@ CREATE TABLE IF NOT EXISTS redeem_codes (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_redeem_open ON redeem_codes(redeemed_at, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS credit_ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER NOT NULL,
+  delta INTEGER NOT NULL,
+  balance INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  ref TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  actor_id INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_account ON credit_ledger(account_id, id DESC);
 `)
 	if err != nil {
 		return err
@@ -172,6 +188,15 @@ func (s *Store) ensureColumns() error {
 		return err
 	}
 	if err := s.addColumnIfMissing("accounts", "credits", `ALTER TABLE accounts ADD COLUMN credits INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("usage_logs", "credit_micro", `ALTER TABLE usage_logs ADD COLUMN credit_micro INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("usage_logs", "account_id", `ALTER TABLE usage_logs ADD COLUMN account_id INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("proxies", "password_enc", `ALTER TABLE proxies ADD COLUMN password_enc BLOB NOT NULL DEFAULT X''`); err != nil {
 		return err
 	}
 	_, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_upstream_key_hash ON upstream_keys(key_hash) WHERE key_hash IS NOT NULL AND key_hash != ''`)
@@ -231,6 +256,7 @@ type Proxy struct {
 	Port          int
 	Username      string
 	Password      string
+	PasswordEnc   []byte
 	Status        string
 	FailCount     int
 	CooldownUntil int64
@@ -298,6 +324,8 @@ type UsageLog struct {
 	Error        string `json:"error"`
 	RequestID    string `json:"request_id"`
 	CreatedAt    int64  `json:"created_at"`
+	CreditMicro  int64  `json:"credit_micro"`
+	AccountID    int64  `json:"account_id"`
 }
 
 const upstreamCols = `id,name,key_enc,key_prefix,key_last4,weight,rpm_limit,status,fail_count,cooldown_until,last_ok_at,last_err_at,last_err,created_at,updated_at,proxy_id`
@@ -555,8 +583,8 @@ func (s *Store) InsertLog(ctx context.Context, l UsageLog) error {
 	if l.OK {
 		ok = 1
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO usage_logs(user_key_id,upstream_id,model,input_tokens,output_tokens,latency_ms,status_code,ok,error,request_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		l.UserKeyID, l.UpstreamID, l.Model, l.InputTokens, l.OutputTokens, l.LatencyMS, l.StatusCode, ok, l.Error, l.RequestID, nowMS())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO usage_logs(user_key_id,upstream_id,model,input_tokens,output_tokens,latency_ms,status_code,ok,error,request_id,created_at,credit_micro,account_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		l.UserKeyID, l.UpstreamID, l.Model, l.InputTokens, l.OutputTokens, l.LatencyMS, l.StatusCode, ok, l.Error, l.RequestID, nowMS(), l.CreditMicro, l.AccountID)
 	return err
 }
 
@@ -582,8 +610,8 @@ func (s *Store) ListLogs(ctx context.Context, f LogFilter) ([]UsageLog, int64, e
 		args = append(args, f.UserKeyID)
 	}
 	if f.OwnerID > 0 {
-		where = append(where, "user_key_id IN (SELECT id FROM user_keys WHERE owner_id=?)")
-		args = append(args, f.OwnerID)
+		where = append(where, "(account_id=? OR user_key_id IN (SELECT id FROM user_keys WHERE owner_id=?))")
+		args = append(args, f.OwnerID, f.OwnerID)
 	}
 	if f.UpstreamID > 0 {
 		where = append(where, "upstream_id=?")
@@ -612,7 +640,7 @@ func (s *Store) ListLogs(ctx context.Context, f LogFilter) ([]UsageLog, int64, e
 		return nil, 0, err
 	}
 	qargs := append(append([]any{}, args...), f.Limit, f.Offset)
-	rows, err := s.db.QueryContext(ctx, `SELECT id,user_key_id,upstream_id,model,input_tokens,output_tokens,latency_ms,status_code,ok,error,request_id,created_at FROM usage_logs WHERE `+w+` ORDER BY id DESC LIMIT ? OFFSET ?`, qargs...)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,user_key_id,upstream_id,model,input_tokens,output_tokens,latency_ms,status_code,ok,error,request_id,created_at,credit_micro,account_id FROM usage_logs WHERE `+w+` ORDER BY id DESC LIMIT ? OFFSET ?`, qargs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -622,7 +650,7 @@ func (s *Store) ListLogs(ctx context.Context, f LogFilter) ([]UsageLog, int64, e
 		var l UsageLog
 		var up sql.NullInt64
 		var ok int
-		if err := rows.Scan(&l.ID, &l.UserKeyID, &up, &l.Model, &l.InputTokens, &l.OutputTokens, &l.LatencyMS, &l.StatusCode, &ok, &l.Error, &l.RequestID, &l.CreatedAt); err != nil {
+		if err := rows.Scan(&l.ID, &l.UserKeyID, &up, &l.Model, &l.InputTokens, &l.OutputTokens, &l.LatencyMS, &l.StatusCode, &ok, &l.Error, &l.RequestID, &l.CreatedAt, &l.CreditMicro, &l.AccountID); err != nil {
 			return nil, 0, err
 		}
 		if up.Valid {
@@ -685,10 +713,10 @@ func (s *Store) StatsFor(ctx context.Context, ownerID int64) (Stats, error) {
 	if ownerID > 0 {
 		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_keys WHERE owner_id=?`, ownerID).Scan(&st.UserKeys)
 		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_keys WHERE owner_id=? AND status='active'`, ownerID).Scan(&st.UserKeysLive)
-		logWhere := `user_key_id IN (SELECT id FROM user_keys WHERE owner_id=?)`
-		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(input_tokens),0) FROM usage_logs WHERE created_at>=? AND `+logWhere, since, ownerID).Scan(&st.Req24h, &st.OK24h, &st.Tokens24h)
-		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(input_tokens),0) FROM usage_logs WHERE `+logWhere, ownerID).Scan(&st.ReqTotal, &st.TokensTotal)
-		rows, err := s.db.QueryContext(ctx, `SELECT latency_ms FROM usage_logs WHERE created_at>=? AND ok=1 AND `+logWhere+` ORDER BY latency_ms`, since, ownerID)
+		logWhere := `(account_id=? OR user_key_id IN (SELECT id FROM user_keys WHERE owner_id=?))`
+		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(input_tokens),0) FROM usage_logs WHERE created_at>=? AND `+logWhere, since, ownerID, ownerID).Scan(&st.Req24h, &st.OK24h, &st.Tokens24h)
+		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(input_tokens),0) FROM usage_logs WHERE `+logWhere, ownerID, ownerID).Scan(&st.ReqTotal, &st.TokensTotal)
+		rows, err := s.db.QueryContext(ctx, `SELECT latency_ms FROM usage_logs WHERE created_at>=? AND ok=1 AND `+logWhere+` ORDER BY latency_ms`, since, ownerID, ownerID)
 		if err == nil {
 			var lats []int64
 			for rows.Next() {
@@ -701,7 +729,7 @@ func (s *Store) StatsFor(ctx context.Context, ownerID int64) (Stats, error) {
 			st.LatencyP50 = percentile(lats, 50)
 			st.LatencyP95 = percentile(lats, 95)
 		}
-		hrows, err := s.db.QueryContext(ctx, `SELECT (created_at/3600000)*3600000 AS b, COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(input_tokens),0), COALESCE(AVG(latency_ms),0) FROM usage_logs WHERE created_at>=? AND `+logWhere+` GROUP BY b ORDER BY b`, since, ownerID)
+		hrows, err := s.db.QueryContext(ctx, `SELECT (created_at/3600000)*3600000 AS b, COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(input_tokens),0), COALESCE(AVG(latency_ms),0) FROM usage_logs WHERE created_at>=? AND `+logWhere+` GROUP BY b ORDER BY b`, since, ownerID, ownerID)
 		if err == nil {
 			defer hrows.Close()
 			for hrows.Next() {
@@ -787,7 +815,7 @@ WHERE l.created_at>=? GROUP BY l.user_key_id ORDER BY COUNT(*) DESC LIMIT 5`, si
 	return st, nil
 }
 
-const proxyCols = `id,name,protocol,host,port,username,password,status,fail_count,cooldown_until,last_ok_at,last_err_at,last_err,last_ip,last_country,last_latency_ms,created_at,updated_at`
+const proxyCols = `id,name,protocol,host,port,username,password,password_enc,status,fail_count,cooldown_until,last_ok_at,last_err_at,last_err,last_ip,last_country,last_latency_ms,created_at,updated_at`
 
 func (s *Store) ListProxies(ctx context.Context) ([]Proxy, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+proxyCols+`, (SELECT COUNT(*) FROM upstream_keys u WHERE u.proxy_id=p.id) FROM proxies p ORDER BY id DESC`)
@@ -835,8 +863,12 @@ func (s *Store) GetProxy(ctx context.Context, id int64) (Proxy, error) {
 
 func (s *Store) InsertProxy(ctx context.Context, p Proxy) (int64, error) {
 	now := nowMS()
-	res, err := s.db.ExecContext(ctx, `INSERT INTO proxies(name,protocol,host,port,username,password,status,fail_count,cooldown_until,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,0,?,?)`,
-		p.Name, p.Protocol, p.Host, p.Port, p.Username, p.Password, nstr(p.Status, "active"), 0, now, now)
+	enc := p.PasswordEnc
+	if enc == nil {
+		enc = []byte{}
+	}
+	res, err := s.db.ExecContext(ctx, `INSERT INTO proxies(name,protocol,host,port,username,password,password_enc,status,fail_count,cooldown_until,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,0,?,?)`,
+		p.Name, p.Protocol, p.Host, p.Port, p.Username, "", enc, nstr(p.Status, "active"), 0, now, now)
 	if err != nil {
 		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
 			return 0, ErrConflict
@@ -846,10 +878,13 @@ func (s *Store) InsertProxy(ctx context.Context, p Proxy) (int64, error) {
 	return res.LastInsertId()
 }
 
-func (s *Store) UpdateProxy(ctx context.Context, id int64, name, protocol, host string, port int, username, password, status string) error {
+func (s *Store) UpdateProxy(ctx context.Context, id int64, name, protocol, host string, port int, username string, passwordEnc []byte, status string) error {
 	now := nowMS()
-	res, err := s.db.ExecContext(ctx, `UPDATE proxies SET name=?, protocol=?, host=?, port=?, username=?, password=?, status=?, updated_at=? WHERE id=?`,
-		name, protocol, host, port, username, password, nstr(status, "active"), now, id)
+	if passwordEnc == nil {
+		passwordEnc = []byte{}
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE proxies SET name=?, protocol=?, host=?, port=?, username=?, password='', password_enc=?, status=?, updated_at=? WHERE id=?`,
+		name, protocol, host, port, username, passwordEnc, nstr(status, "active"), now, id)
 	if err != nil {
 		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
 			return ErrConflict
@@ -947,7 +982,7 @@ func scanProxy(row scanner, withBound bool) (Proxy, error) {
 	var lastOK, lastErr sql.NullInt64
 	var lastErrS sql.NullString
 	args := []any{
-		&p.ID, &p.Name, &p.Protocol, &p.Host, &p.Port, &p.Username, &p.Password, &p.Status,
+		&p.ID, &p.Name, &p.Protocol, &p.Host, &p.Port, &p.Username, &p.Password, &p.PasswordEnc, &p.Status,
 		&p.FailCount, &p.CooldownUntil, &lastOK, &lastErr, &lastErrS, &p.LastIP, &p.LastCountry,
 		&p.LastLatencyMS, &p.CreatedAt, &p.UpdatedAt,
 	}
@@ -1043,7 +1078,33 @@ func (s *Store) InsertAccount(ctx context.Context, username, passwordHash, role 
 	if role != RoleAdmin {
 		role = RoleUser
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO accounts(username,password_hash,role,status,credits,created_at,updated_at) VALUES(?,?,?,'active',0,?,?)`,
+	return s.insertAccount(ctx, username, passwordHash, role, false, now)
+}
+
+// InsertBootstrapAccount 只在账号表为空时写入管理员。并发注册里只有一个能成功。
+func (s *Store) InsertBootstrapAccount(ctx context.Context, username, passwordHash string) (int64, error) {
+	return s.insertAccount(ctx, username, passwordHash, RoleAdmin, true, nowMS())
+}
+
+func (s *Store) insertAccount(ctx context.Context, username, passwordHash, role string, onlyIfEmpty bool, now int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if onlyIfEmpty {
+		if _, err := tx.ExecContext(ctx, `UPDATE accounts SET username=username WHERE id=(SELECT MIN(id) FROM accounts)`); err != nil {
+			return 0, err
+		}
+		var n int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&n); err != nil {
+			return 0, err
+		}
+		if n > 0 {
+			return 0, ErrConflict
+		}
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO accounts(username,password_hash,role,status,credits,created_at,updated_at) VALUES(?,?,?,'active',0,?,?)`,
 		username, passwordHash, role, now, now)
 	if err != nil {
 		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
@@ -1051,7 +1112,14 @@ func (s *Store) InsertAccount(ctx context.Context, username, passwordHash, role 
 		}
 		return 0, err
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 func (s *Store) GetAccountByUsername(ctx context.Context, username string) (Account, error) {
@@ -1108,19 +1176,74 @@ func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
 	return err
 }
 
+func (s *Store) DeleteAccountSessions(ctx context.Context, accountID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE account_id=?`, accountID)
+	return err
+}
+
+func (s *Store) UpdatePassword(ctx context.Context, id int64, passwordHash string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET password_hash=?, updated_at=? WHERE id=?`, passwordHash, nowMS(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return s.DeleteAccountSessions(ctx, id)
+}
+
+func (s *Store) SetAccountStatus(ctx context.Context, id int64, status string) error {
+	if status != "active" && status != "disabled" {
+		return fmt.Errorf("bad status")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET status=?, updated_at=? WHERE id=?`, status, nowMS(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	if status != "active" {
+		if err := s.DeleteAccountSessions(ctx, id); err != nil {
+			return err
+		}
+		_, err = s.db.ExecContext(ctx, `UPDATE user_keys SET status='disabled', updated_at=? WHERE owner_id=? AND status='active'`, nowMS(), id)
+		return err
+	}
+	return nil
+}
+
 var ErrInsufficientCredits = errors.New("insufficient credits")
 
 // 1 积分 = 1 美元。微积分，1e6 = $1。
 const CreditScale int64 = 1_000_000
 
 func (s *Store) AdjustCredits(ctx context.Context, id, delta int64, allowNegative bool) (int64, error) {
+	return s.PostCredit(ctx, id, delta, allowNegative, LedgerAdjust, "", "", nil)
+}
+
+// PostCredit 改余额并写一条流水。delta 为微积分，可正可负。
+func (s *Store) PostCredit(ctx context.Context, id, delta int64, allowNegative bool, reason, ref, note string, actorID *int64) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	next, err := postCreditTx(ctx, tx, id, delta, allowNegative, reason, ref, note, actorID)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+func postCreditTx(ctx context.Context, tx *sql.Tx, id, delta int64, allowNegative bool, reason, ref, note string, actorID *int64) (int64, error) {
 	var cur int64
-	err = tx.QueryRowContext(ctx, `SELECT credits FROM accounts WHERE id=?`, id).Scan(&cur)
+	err := tx.QueryRowContext(ctx, `SELECT credits FROM accounts WHERE id=?`, id).Scan(&cur)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, ErrNotFound
 	}
@@ -1131,11 +1254,14 @@ func (s *Store) AdjustCredits(ctx context.Context, id, delta int64, allowNegativ
 	if next < 0 && !allowNegative {
 		return cur, ErrInsufficientCredits
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET credits=?, updated_at=? WHERE id=?`, next, nowMS(), id); err != nil {
+	now := nowMS()
+	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET credits=?, updated_at=? WHERE id=?`, next, now, id); err != nil {
 		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
+	if delta != 0 {
+		if err := insertLedger(ctx, tx, id, delta, next, reason, ref, note, actorID, now); err != nil {
+			return 0, err
+		}
 	}
 	return next, nil
 }
@@ -1252,16 +1378,8 @@ func (s *Store) RedeemCode(ctx context.Context, codeHash string, accountID int64
 	if n != 1 {
 		return 0, 0, ErrRedeemUsed
 	}
-	res, err = tx.ExecContext(ctx, `UPDATE accounts SET credits=credits+?, updated_at=? WHERE id=?`, credits, now, accountID)
+	next, err := postCreditTx(ctx, tx, accountID, credits, true, LedgerRedeem, fmt.Sprintf("code:%d", id), "", nil)
 	if err != nil {
-		return 0, 0, err
-	}
-	n, _ = res.RowsAffected()
-	if n != 1 {
-		return 0, 0, ErrNotFound
-	}
-	var next int64
-	if err := tx.QueryRowContext(ctx, `SELECT credits FROM accounts WHERE id=?`, accountID).Scan(&next); err != nil {
 		return 0, 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1270,12 +1388,104 @@ func (s *Store) RedeemCode(ctx context.Context, codeHash string, accountID int64
 	return credits, next, nil
 }
 
+const (
+	LedgerAdjust = "adjust"
+	LedgerRedeem = "redeem"
+	LedgerHold   = "hold"
+	LedgerSettle = "settle"
+)
+
+type CreditEntry struct {
+	ID        int64
+	AccountID int64
+	Delta     int64
+	Balance   int64
+	Reason    string
+	Ref       string
+	Note      string
+	ActorID   *int64
+	CreatedAt int64
+}
+
+func insertLedger(ctx context.Context, tx *sql.Tx, accountID, delta, balance int64, reason, ref, note string, actorID *int64, now int64) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO credit_ledger(account_id,delta,balance,reason,ref,note,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+		accountID, delta, balance, reason, ref, note, actorID, now)
+	return err
+}
+
+func (s *Store) ListCreditLedger(ctx context.Context, accountID int64, limit int) ([]CreditEntry, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	q := `SELECT id,account_id,delta,balance,reason,ref,note,actor_id,created_at FROM credit_ledger`
+	args := []any{}
+	if accountID > 0 {
+		q += ` WHERE account_id=?`
+		args = append(args, accountID)
+	}
+	q += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CreditEntry
+	for rows.Next() {
+		var e CreditEntry
+		var actor sql.NullInt64
+		if err := rows.Scan(&e.ID, &e.AccountID, &e.Delta, &e.Balance, &e.Reason, &e.Ref, &e.Note, &actor, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		if actor.Valid {
+			v := actor.Int64
+			e.ActorID = &v
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // $42 / 1e9 input tokens，单位是微积分（1e6 = $1）。
 // cost = tokens * 42 / 1000，四舍五入，至少 1。
 const (
 	InputUSDPerTokenNum int64 = 42
 	InputUSDPerTokenDen int64 = 1000
 )
+
+// UsageCost 把 input tokens 换成微积分。有用量时至少 1。
+func UsageCost(inputTokens int64) int64 {
+	if inputTokens <= 0 {
+		return 0
+	}
+	cost := (inputTokens*InputUSDPerTokenNum + InputUSDPerTokenDen/2) / InputUSDPerTokenDen
+	if cost < 1 {
+		cost = 1
+	}
+	return cost
+}
+
+// SettleUsage 结清一次调用。hold 是转发前已扣除的微积分。
+// 成功则按用量多退少补；失败则把 hold 退回。补差不允许把余额扣成负数。
+func (s *Store) SettleUsage(ctx context.Context, accountID, hold, cost int64, ref string, ok bool) (charged int64, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	target := int64(0)
+	if ok {
+		target = cost
+	}
+	delta := -(target - hold) // hold 已扣，这里补差额：多扣了就退（正），少扣了再扣（负）
+	if _, err := postCreditTx(ctx, tx, accountID, delta, false, LedgerSettle, ref, "", nil); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return target, nil
+}
 
 func PrefixLast4(plain string) (string, string) {
 	last4 := plain

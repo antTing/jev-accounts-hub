@@ -54,6 +54,39 @@ func (l *Limiter) Allow(key string, rpm int) (ok bool, retryAfter time.Duration)
 	return true, 0
 }
 
+// AllowWindow 在 window 内最多放行 limit 次。limit<=0 表示不限制。
+func (l *Limiter) AllowWindow(key string, limit int, span time.Duration) (ok bool, retryAfter time.Duration) {
+	if limit <= 0 || span <= 0 {
+		return true, 0
+	}
+	now := time.Now().UnixMilli()
+	width := span.Milliseconds()
+	cutoff := now - width
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	w := l.windows[key]
+	if w == nil {
+		w = &window{}
+		l.windows[key] = w
+	}
+	i := 0
+	for i < len(w.times) && w.times[i] <= cutoff {
+		i++
+	}
+	if i > 0 {
+		w.times = append([]int64{}, w.times[i:]...)
+	}
+	if len(w.times) >= limit {
+		wait := time.Duration(w.times[0]+width-now) * time.Millisecond
+		if wait < time.Second {
+			wait = time.Second
+		}
+		return false, wait
+	}
+	w.times = append(w.times, now)
+	return true, 0
+}
+
 func (l *Limiter) gc() {
 	t := time.NewTicker(2 * time.Minute)
 	defer t.Stop()
