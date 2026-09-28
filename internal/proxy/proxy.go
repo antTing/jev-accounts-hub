@@ -89,6 +89,15 @@ func (g *Gateway) Authenticate(r *http.Request) (store.UserKey, error) {
 	if k.TokenQuota > 0 && k.TokensUsed >= k.TokenQuota {
 		return store.UserKey{}, errHTTP(402, "quota_exceeded", "token quota exceeded")
 	}
+	if k.OwnerID != nil {
+		ok, err := g.Store.TrySpendCredits(r.Context(), *k.OwnerID, 0)
+		if err != nil {
+			return store.UserKey{}, errHTTP(500, "internal_error", "credit check failed")
+		}
+		if !ok {
+			return store.UserKey{}, errHTTP(402, "insufficient_credits", "积分不足")
+		}
+	}
 	if ok, wait := g.Limit.Allow(fmt.Sprintf("u:%d", k.ID), k.RPMLimit); !ok {
 		e := errHTTP(429, "rate_limited", "user rpm limit exceeded")
 		e.retryAfter = int(wait.Seconds())
@@ -209,6 +218,15 @@ func (g *Gateway) Evaluate(ctx context.Context, user *store.UserKey, body []byte
 			g.Pool.MarkOK(ctx, upID)
 			if user != nil {
 				_ = g.Store.AddTokens(ctx, user.ID, inTok)
+				if user.OwnerID != nil && inTok > 0 {
+					cost := (inTok*store.InputUSDPerTokenNum + store.InputUSDPerTokenDen/2) / store.InputUSDPerTokenDen
+					if cost < 1 {
+						cost = 1
+					}
+					if spent, err := g.Store.TrySpendCredits(ctx, *user.OwnerID, cost); err != nil || !spent {
+						g.Log.Warn("credit spend", "account", *user.OwnerID, "cost", cost, "spent", spent, "err", err)
+					}
+				}
 			}
 		}
 		_ = g.Store.InsertLog(ctx, store.UsageLog{

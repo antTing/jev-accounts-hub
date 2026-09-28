@@ -119,6 +119,38 @@ CREATE TABLE IF NOT EXISTS proxies (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_endpoint ON proxies(protocol, host, port, username, password);
 CREATE INDEX IF NOT EXISTS idx_proxy_status ON proxies(status);
+
+CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user',
+  status TEXT NOT NULL DEFAULT 'active',
+  credits INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  account_id INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id);
+
+CREATE TABLE IF NOT EXISTS redeem_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code_hash TEXT NOT NULL UNIQUE,
+  code_prefix TEXT NOT NULL,
+  credits INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_by INTEGER,
+  redeemed_by INTEGER,
+  redeemed_at INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_redeem_open ON redeem_codes(redeemed_at, created_at DESC);
 `)
 	if err != nil {
 		return err
@@ -136,7 +168,17 @@ func (s *Store) ensureColumns() error {
 	if err := s.addColumnIfMissing("upstream_keys", "proxy_id", `ALTER TABLE upstream_keys ADD COLUMN proxy_id INTEGER`); err != nil {
 		return err
 	}
+	if err := s.addColumnIfMissing("user_keys", "owner_id", `ALTER TABLE user_keys ADD COLUMN owner_id INTEGER`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("accounts", "credits", `ALTER TABLE accounts ADD COLUMN credits INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_upstream_key_hash ON upstream_keys(key_hash) WHERE key_hash IS NOT NULL AND key_hash != ''`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_user_keys_owner ON user_keys(owner_id)`)
 	return err
 }
 
@@ -224,6 +266,7 @@ type UserKey struct {
 	ExpiresAt  *int64
 	LastUsedAt *int64
 	Note       string
+	OwnerID    *int64
 	CreatedAt  int64
 	UpdatedAt  int64
 }
@@ -401,8 +444,8 @@ func (s *Store) TouchUpstreamErr(ctx context.Context, id int64, msg string, cool
 
 func (s *Store) InsertUserKey(ctx context.Context, k UserKey) (int64, error) {
 	now := nowMS()
-	res, err := s.db.ExecContext(ctx, `INSERT INTO user_keys(name,key_hash,key_prefix,key_last4,rpm_limit,token_quota,tokens_used,status,expires_at,note,created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?,?,?,?)`,
-		k.Name, k.KeyHash, k.KeyPrefix, k.KeyLast4, nz(k.RPMLimit, 60), k.TokenQuota, nstr(k.Status, "active"), k.ExpiresAt, k.Note, now, now)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO user_keys(name,key_hash,key_prefix,key_last4,rpm_limit,token_quota,tokens_used,status,expires_at,note,owner_id,created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?)`,
+		k.Name, k.KeyHash, k.KeyPrefix, k.KeyLast4, nz(k.RPMLimit, 60), k.TokenQuota, nstr(k.Status, "active"), k.ExpiresAt, k.Note, k.OwnerID, now, now)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return 0, ErrConflict
@@ -413,7 +456,22 @@ func (s *Store) InsertUserKey(ctx context.Context, k UserKey) (int64, error) {
 }
 
 func (s *Store) ListUserKeys(ctx context.Context) ([]UserKey, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,key_hash,key_prefix,key_last4,rpm_limit,token_quota,tokens_used,status,expires_at,last_used_at,note,created_at,updated_at FROM user_keys ORDER BY id DESC`)
+	return s.listUserKeys(ctx, 0)
+}
+
+func (s *Store) ListUserKeysByOwner(ctx context.Context, ownerID int64) ([]UserKey, error) {
+	return s.listUserKeys(ctx, ownerID)
+}
+
+func (s *Store) listUserKeys(ctx context.Context, ownerID int64) ([]UserKey, error) {
+	q := `SELECT id,name,key_hash,key_prefix,key_last4,rpm_limit,token_quota,tokens_used,status,expires_at,last_used_at,note,owner_id,created_at,updated_at FROM user_keys`
+	var args []any
+	if ownerID > 0 {
+		q += ` WHERE owner_id=?`
+		args = append(args, ownerID)
+	}
+	q += ` ORDER BY id DESC`
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +488,7 @@ func (s *Store) ListUserKeys(ctx context.Context) ([]UserKey, error) {
 }
 
 func (s *Store) GetUserKey(ctx context.Context, id int64) (UserKey, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id,name,key_hash,key_prefix,key_last4,rpm_limit,token_quota,tokens_used,status,expires_at,last_used_at,note,created_at,updated_at FROM user_keys WHERE id=?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id,name,key_hash,key_prefix,key_last4,rpm_limit,token_quota,tokens_used,status,expires_at,last_used_at,note,owner_id,created_at,updated_at FROM user_keys WHERE id=?`, id)
 	k, err := scanUser(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return UserKey{}, ErrNotFound
@@ -439,7 +497,7 @@ func (s *Store) GetUserKey(ctx context.Context, id int64) (UserKey, error) {
 }
 
 func (s *Store) LookupUserKey(ctx context.Context, hash string) (UserKey, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id,name,key_hash,key_prefix,key_last4,rpm_limit,token_quota,tokens_used,status,expires_at,last_used_at,note,created_at,updated_at FROM user_keys WHERE key_hash=?`, hash)
+	row := s.db.QueryRowContext(ctx, `SELECT id,name,key_hash,key_prefix,key_last4,rpm_limit,token_quota,tokens_used,status,expires_at,last_used_at,note,owner_id,created_at,updated_at FROM user_keys WHERE key_hash=?`, hash)
 	k, err := scanUser(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return UserKey{}, ErrNotFound
@@ -504,6 +562,7 @@ func (s *Store) InsertLog(ctx context.Context, l UsageLog) error {
 
 type LogFilter struct {
 	UserKeyID  int64
+	OwnerID    int64
 	UpstreamID int64
 	OK         *bool
 	Q          string
@@ -521,6 +580,10 @@ func (s *Store) ListLogs(ctx context.Context, f LogFilter) ([]UsageLog, int64, e
 	if f.UserKeyID > 0 {
 		where = append(where, "user_key_id=?")
 		args = append(args, f.UserKeyID)
+	}
+	if f.OwnerID > 0 {
+		where = append(where, "user_key_id IN (SELECT id FROM user_keys WHERE owner_id=?)")
+		args = append(args, f.OwnerID)
 	}
 	if f.UpstreamID > 0 {
 		where = append(where, "upstream_id=?")
@@ -609,18 +672,72 @@ type Stats struct {
 }
 
 func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	return s.StatsFor(ctx, 0)
+}
+
+// StatsFor ownerID>0 时只统计该账号名下用户 Key 的用量；0 为全库。
+func (s *Store) StatsFor(ctx context.Context, ownerID int64) (Stats, error) {
 	var st Stats
 	st.Hourly = []HourPoint{}
 	st.TopKeys = []TopKey{}
+	now := nowMS()
+	since := time.Now().Add(-24 * time.Hour).UnixMilli()
+	if ownerID > 0 {
+		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_keys WHERE owner_id=?`, ownerID).Scan(&st.UserKeys)
+		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_keys WHERE owner_id=? AND status='active'`, ownerID).Scan(&st.UserKeysLive)
+		logWhere := `user_key_id IN (SELECT id FROM user_keys WHERE owner_id=?)`
+		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(input_tokens),0) FROM usage_logs WHERE created_at>=? AND `+logWhere, since, ownerID).Scan(&st.Req24h, &st.OK24h, &st.Tokens24h)
+		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(input_tokens),0) FROM usage_logs WHERE `+logWhere, ownerID).Scan(&st.ReqTotal, &st.TokensTotal)
+		rows, err := s.db.QueryContext(ctx, `SELECT latency_ms FROM usage_logs WHERE created_at>=? AND ok=1 AND `+logWhere+` ORDER BY latency_ms`, since, ownerID)
+		if err == nil {
+			var lats []int64
+			for rows.Next() {
+				var v int64
+				if rows.Scan(&v) == nil {
+					lats = append(lats, v)
+				}
+			}
+			_ = rows.Close()
+			st.LatencyP50 = percentile(lats, 50)
+			st.LatencyP95 = percentile(lats, 95)
+		}
+		hrows, err := s.db.QueryContext(ctx, `SELECT (created_at/3600000)*3600000 AS b, COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(input_tokens),0), COALESCE(AVG(latency_ms),0) FROM usage_logs WHERE created_at>=? AND `+logWhere+` GROUP BY b ORDER BY b`, since, ownerID)
+		if err == nil {
+			defer hrows.Close()
+			for hrows.Next() {
+				var hp HourPoint
+				if hrows.Scan(&hp.T, &hp.Req, &hp.OK, &hp.Tokens, &hp.AvgMS) == nil {
+					st.Hourly = append(st.Hourly, hp)
+				}
+			}
+		}
+		trows, err := s.db.QueryContext(ctx, `SELECT l.user_key_id, k.name, k.key_prefix, k.key_last4, COUNT(*), COALESCE(SUM(l.input_tokens),0)
+FROM usage_logs l LEFT JOIN user_keys k ON k.id=l.user_key_id
+WHERE l.created_at>=? AND k.owner_id=? GROUP BY l.user_key_id ORDER BY COUNT(*) DESC LIMIT 5`, since, ownerID)
+		if err == nil {
+			defer trows.Close()
+			for trows.Next() {
+				var tk TopKey
+				var prefix, last4 string
+				if trows.Scan(&tk.UserKeyID, &tk.Name, &prefix, &last4, &tk.Req, &tk.Tokens) == nil {
+					tk.Mask = prefix + "****" + last4
+					st.TopKeys = append(st.TopKeys, tk)
+				}
+			}
+		}
+		st.Fail24h = st.Req24h - st.OK24h
+		if st.Fail24h < 0 {
+			st.Fail24h = 0
+		}
+		return st, nil
+	}
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM upstream_keys`).Scan(&st.Upstreams)
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM upstream_keys WHERE status='active'`).Scan(&st.UpstreamsLive)
-	now := nowMS()
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM upstream_keys WHERE status='active' AND cooldown_until>?`, now).Scan(&st.UpstreamsCool)
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_keys`).Scan(&st.UserKeys)
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_keys WHERE status='active'`).Scan(&st.UserKeysLive)
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM proxies`).Scan(&st.Proxies)
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM proxies WHERE status='active'`).Scan(&st.ProxiesLive)
-	since := time.Now().Add(-24 * time.Hour).UnixMilli()
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(input_tokens),0) FROM usage_logs WHERE created_at>=?`, since).Scan(&st.Req24h, &st.OK24h, &st.Tokens24h)
 	st.Fail24h = st.Req24h - st.OK24h
 	if st.Fail24h < 0 {
@@ -856,8 +973,8 @@ func scanProxy(row scanner, withBound bool) (Proxy, error) {
 
 func scanUser(row scanner) (UserKey, error) {
 	var k UserKey
-	var exp, last sql.NullInt64
-	err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.KeyPrefix, &k.KeyLast4, &k.RPMLimit, &k.TokenQuota, &k.TokensUsed, &k.Status, &exp, &last, &k.Note, &k.CreatedAt, &k.UpdatedAt)
+	var exp, last, owner sql.NullInt64
+	err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.KeyPrefix, &k.KeyLast4, &k.RPMLimit, &k.TokenQuota, &k.TokensUsed, &k.Status, &exp, &last, &k.Note, &owner, &k.CreatedAt, &k.UpdatedAt)
 	if err != nil {
 		return k, err
 	}
@@ -868,6 +985,10 @@ func scanUser(row scanner) (UserKey, error) {
 	if last.Valid {
 		v := last.Int64
 		k.LastUsedAt = &v
+	}
+	if owner.Valid {
+		v := owner.Int64
+		k.OwnerID = &v
 	}
 	return k, nil
 }
@@ -892,6 +1013,269 @@ func nullInt(v *int64) any {
 	}
 	return *v
 }
+
+const (
+	RoleAdmin = "admin"
+	RoleUser  = "user"
+)
+
+type Account struct {
+	ID           int64
+	Username     string
+	PasswordHash string
+	Role         string
+	Status       string
+	Credits      int64
+	CreatedAt    int64
+	UpdatedAt    int64
+}
+
+func (a Account) IsAdmin() bool { return a.Role == RoleAdmin && a.Status == "active" }
+
+func (s *Store) CountAccounts(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&n)
+	return n, err
+}
+
+func (s *Store) InsertAccount(ctx context.Context, username, passwordHash, role string) (int64, error) {
+	now := nowMS()
+	if role != RoleAdmin {
+		role = RoleUser
+	}
+	res, err := s.db.ExecContext(ctx, `INSERT INTO accounts(username,password_hash,role,status,credits,created_at,updated_at) VALUES(?,?,?,'active',0,?,?)`,
+		username, passwordHash, role, now, now)
+	if err != nil {
+		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
+			return 0, ErrConflict
+		}
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *Store) GetAccountByUsername(ctx context.Context, username string) (Account, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id,username,password_hash,role,status,credits,created_at,updated_at FROM accounts WHERE username=?`, username)
+	return scanAccount(row)
+}
+
+func (s *Store) GetAccount(ctx context.Context, id int64) (Account, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id,username,password_hash,role,status,credits,created_at,updated_at FROM accounts WHERE id=?`, id)
+	return scanAccount(row)
+}
+
+func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,username,password_hash,role,status,credits,created_at,updated_at FROM accounts ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Account
+	for rows.Next() {
+		a, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func scanAccount(row scanner) (Account, error) {
+	var a Account
+	err := row.Scan(&a.ID, &a.Username, &a.PasswordHash, &a.Role, &a.Status, &a.Credits, &a.CreatedAt, &a.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Account{}, ErrNotFound
+	}
+	return a, err
+}
+
+func (s *Store) InsertSession(ctx context.Context, tokenHash string, accountID, expiresAt int64) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO sessions(token_hash,account_id,expires_at,created_at) VALUES(?,?,?,?)`,
+		tokenHash, accountID, expiresAt, nowMS())
+	return err
+}
+
+func (s *Store) AccountBySession(ctx context.Context, tokenHash string) (Account, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT a.id,a.username,a.password_hash,a.role,a.status,a.credits,a.created_at,a.updated_at
+		FROM sessions s JOIN accounts a ON a.id=s.account_id
+		WHERE s.token_hash=? AND s.expires_at>? AND a.status='active'`, tokenHash, nowMS())
+	return scanAccount(row)
+}
+
+func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash=?`, tokenHash)
+	return err
+}
+
+var ErrInsufficientCredits = errors.New("insufficient credits")
+
+// 1 积分 = 1 美元。微积分，1e6 = $1。
+const CreditScale int64 = 1_000_000
+
+func (s *Store) AdjustCredits(ctx context.Context, id, delta int64, allowNegative bool) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var cur int64
+	err = tx.QueryRowContext(ctx, `SELECT credits FROM accounts WHERE id=?`, id).Scan(&cur)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	next := cur + delta
+	if next < 0 && !allowNegative {
+		return cur, ErrInsufficientCredits
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET credits=?, updated_at=? WHERE id=?`, next, nowMS(), id); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+func (s *Store) TrySpendCredits(ctx context.Context, id, amount int64) (bool, error) {
+	if amount <= 0 {
+		var cur int64
+		err := s.db.QueryRowContext(ctx, `SELECT credits FROM accounts WHERE id=?`, id).Scan(&cur)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		return err == nil && cur > 0, err
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET credits=credits-?, updated_at=? WHERE id=? AND credits>=?`,
+		amount, nowMS(), id, amount)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+var ErrRedeemUsed = errors.New("redeem code used")
+
+type RedeemCode struct {
+	ID         int64
+	CodeHash   string
+	CodePrefix string
+	Credits    int64
+	Note       string
+	CreatedBy  *int64
+	RedeemedBy *int64
+	RedeemedAt *int64
+	CreatedAt  int64
+}
+
+func (s *Store) InsertRedeemCodes(ctx context.Context, items []RedeemCode) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := nowMS()
+	for _, it := range items {
+		if it.Credits <= 0 {
+			return fmt.Errorf("credits must be positive")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO redeem_codes(code_hash,code_prefix,credits,note,created_by,created_at) VALUES(?,?,?,?,?,?)`,
+			it.CodeHash, it.CodePrefix, it.Credits, it.Note, it.CreatedBy, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ListRedeemCodes(ctx context.Context, limit int) ([]RedeemCode, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,code_hash,code_prefix,credits,note,created_by,redeemed_by,redeemed_at,created_at
+FROM redeem_codes ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RedeemCode
+	for rows.Next() {
+		var it RedeemCode
+		var createdBy, redeemedBy, redeemedAt sql.NullInt64
+		if err := rows.Scan(&it.ID, &it.CodeHash, &it.CodePrefix, &it.Credits, &it.Note, &createdBy, &redeemedBy, &redeemedAt, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		if createdBy.Valid {
+			v := createdBy.Int64
+			it.CreatedBy = &v
+		}
+		if redeemedBy.Valid {
+			v := redeemedBy.Int64
+			it.RedeemedBy = &v
+		}
+		if redeemedAt.Valid {
+			v := redeemedAt.Int64
+			it.RedeemedAt = &v
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) RedeemCode(ctx context.Context, codeHash string, accountID int64) (added int64, balance int64, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var id, credits int64
+	var redeemedAt sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT id, credits, redeemed_at FROM redeem_codes WHERE code_hash=?`, codeHash).Scan(&id, &credits, &redeemedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	if redeemedAt.Valid {
+		return 0, 0, ErrRedeemUsed
+	}
+	now := nowMS()
+	res, err := tx.ExecContext(ctx, `UPDATE redeem_codes SET redeemed_by=?, redeemed_at=? WHERE id=? AND redeemed_at IS NULL`, accountID, now, id)
+	if err != nil {
+		return 0, 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return 0, 0, ErrRedeemUsed
+	}
+	res, err = tx.ExecContext(ctx, `UPDATE accounts SET credits=credits+?, updated_at=? WHERE id=?`, credits, now, accountID)
+	if err != nil {
+		return 0, 0, err
+	}
+	n, _ = res.RowsAffected()
+	if n != 1 {
+		return 0, 0, ErrNotFound
+	}
+	var next int64
+	if err := tx.QueryRowContext(ctx, `SELECT credits FROM accounts WHERE id=?`, accountID).Scan(&next); err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return credits, next, nil
+}
+
+// $42 / 1e9 input tokens，单位是微积分（1e6 = $1）。
+// cost = tokens * 42 / 1000，四舍五入，至少 1。
+const (
+	InputUSDPerTokenNum int64 = 42
+	InputUSDPerTokenDen int64 = 1000
+)
 
 func PrefixLast4(plain string) (string, string) {
 	last4 := plain

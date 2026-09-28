@@ -6,10 +6,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/crypto/bcrypt"
 	"io"
 	"os"
 )
@@ -80,6 +82,21 @@ func RandomString(n int) (string, error) {
 		out[i] = alphabet[int(b[i])%len(alphabet)]
 	}
 	return string(out), nil
+}
+
+func HashPassword(plain string) (string, error) {
+	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func CheckPassword(hash, plain string) bool {
+	if hash == "" || plain == "" {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
 }
 
 // HashAPIKey 高熵用户 Key 用 SHA-256 即可，可直接当唯一索引。

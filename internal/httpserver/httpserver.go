@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -69,9 +71,27 @@ func (s *Server) Handler() http.Handler {
 	v1.POST("/systemone", s.handleSystemOne)
 	v1.GET("/models", s.handleModels)
 
+	r.POST("/admin/api/register", s.register)
+	r.POST("/admin/api/login", s.login)
+
+	authed := r.Group("/admin/api")
+	authed.Use(s.requireAccount())
+	authed.POST("/logout", s.logout)
+	authed.GET("/me", s.me)
+	authed.GET("/stats", s.adminStats)
+	authed.GET("/keys", s.adminListKeys)
+	authed.POST("/keys", s.adminCreateKey)
+	authed.PUT("/keys/:id", s.adminUpdateKey)
+	authed.DELETE("/keys/:id", s.adminDeleteKey)
+	authed.POST("/keys/:id/reset-usage", s.adminResetKeyUsage)
+	authed.GET("/logs", s.adminLogs)
+	authed.GET("/credits", s.myCredits)
+	authed.POST("/redeem", s.redeemCode)
+	authed.POST("/playground", s.adminPlayground)
+
 	admin := r.Group("/admin/api")
-	admin.Use(s.requireAdmin())
-	admin.GET("/stats", s.adminStats)
+	admin.Use(s.requireAccount())
+	admin.Use(s.requireRoleAdmin())
 	admin.GET("/upstreams", s.adminListUpstreams)
 	admin.POST("/upstreams", s.adminCreateUpstream)
 	admin.POST("/upstreams/import", s.adminImportUpstreams)
@@ -79,19 +99,16 @@ func (s *Server) Handler() http.Handler {
 	admin.PUT("/upstreams/:id", s.adminUpdateUpstream)
 	admin.DELETE("/upstreams/:id", s.adminDeleteUpstream)
 	admin.POST("/upstreams/:id/probe", s.adminProbeUpstream)
-	admin.GET("/keys", s.adminListKeys)
-	admin.POST("/keys", s.adminCreateKey)
-	admin.PUT("/keys/:id", s.adminUpdateKey)
-	admin.DELETE("/keys/:id", s.adminDeleteKey)
-	admin.POST("/keys/:id/reset-usage", s.adminResetKeyUsage)
-	admin.GET("/logs", s.adminLogs)
-	admin.POST("/playground", s.adminPlayground)
 	admin.GET("/proxies", s.adminListProxies)
 	admin.POST("/proxies", s.adminCreateProxy)
 	admin.POST("/proxies/import", s.adminImportProxies)
 	admin.PUT("/proxies/:id", s.adminUpdateProxy)
 	admin.DELETE("/proxies/:id", s.adminDeleteProxy)
 	admin.POST("/proxies/:id/probe", s.adminProbeProxy)
+	admin.GET("/accounts", s.adminListAccounts)
+	admin.POST("/accounts/:id/credits", s.adminAdjustCredits)
+	admin.GET("/redeem-codes", s.adminListRedeemCodes)
+	admin.POST("/redeem-codes", s.adminCreateRedeemCodes)
 
 	r.GET("/", func(c *gin.Context) {
 		c.Header("Content-Type", "text/html; charset=utf-8")
@@ -154,19 +171,190 @@ func (s *Server) accessLog() gin.HandlerFunc {
 	}
 }
 
-func (s *Server) requireAdmin() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		tok := c.GetHeader("X-Admin-Token")
-		if tok == "" {
-			if auth := c.GetHeader("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-				tok = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-			}
+const sessionTTL = 14 * 24 * time.Hour
+
+func readToken(c *gin.Context) string {
+	tok := strings.TrimSpace(c.GetHeader("X-Admin-Token"))
+	if tok == "" {
+		if auth := c.GetHeader("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			tok = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 		}
-		if !cryptox.EqualToken(strings.TrimSpace(tok), strings.TrimSpace(s.cfg.AdminToken)) {
-			c.AbortWithStatusJSON(401, gin.H{"error": gin.H{"type": "unauthorized", "message": "invalid admin token"}})
+	}
+	return tok
+}
+
+func (s *Server) requireAccount() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tok := readToken(c)
+		if cryptox.EqualToken(tok, strings.TrimSpace(s.cfg.AdminToken)) {
+			c.Set("role", store.RoleAdmin)
+			c.Set("break_glass", true)
+			c.Next()
+			return
+		}
+		if tok == "" {
+			c.AbortWithStatusJSON(401, gin.H{"error": gin.H{"type": "unauthorized", "message": "login required"}})
+			return
+		}
+		acc, err := s.store.AccountBySession(c.Request.Context(), cryptox.HashAPIKey(tok))
+		if err != nil {
+			c.AbortWithStatusJSON(401, gin.H{"error": gin.H{"type": "unauthorized", "message": "login required"}})
+			return
+		}
+		c.Set("account", acc)
+		c.Set("role", acc.Role)
+		c.Next()
+	}
+}
+
+func (s *Server) requireRoleAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetString("role") != store.RoleAdmin {
+			c.AbortWithStatusJSON(403, gin.H{"error": gin.H{"type": "forbidden", "message": "admin only"}})
 			return
 		}
 		c.Next()
+	}
+}
+
+func (s *Server) currentAccount(c *gin.Context) (store.Account, bool) {
+	v, ok := c.Get("account")
+	if !ok {
+		return store.Account{}, false
+	}
+	acc, ok := v.(store.Account)
+	return acc, ok
+}
+
+func (s *Server) isAdmin(c *gin.Context) bool {
+	return c.GetString("role") == store.RoleAdmin
+}
+
+type authReq struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func validUsername(name string) bool {
+	n := utf8.RuneCountInString(name)
+	if n < 3 || n > 32 {
+		return false
+	}
+	for _, r := range name {
+		if r > 127 || !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) register(c *gin.Context) {
+	var req authReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.fail(c, 400, "invalid json")
+		return
+	}
+	name := strings.TrimSpace(req.Username)
+	pass := req.Password
+	if !validUsername(name) {
+		s.fail(c, 400, "用户名需 3-32 位字母、数字、_-.")
+		return
+	}
+	if utf8.RuneCountInString(pass) < 8 || len(pass) > 128 {
+		s.fail(c, 400, "密码至少 8 位")
+		return
+	}
+	hash, err := cryptox.HashPassword(pass)
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	role := store.RoleUser
+	n, err := s.store.CountAccounts(c.Request.Context())
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	if n == 0 {
+		role = store.RoleAdmin
+	}
+	id, err := s.store.InsertAccount(c.Request.Context(), name, hash, role)
+	if errors.Is(err, store.ErrConflict) {
+		s.fail(c, 409, "用户名已存在")
+		return
+	}
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	tok, acc, err := s.issueSession(c, id)
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	c.JSON(201, gin.H{"token": tok, "account": accountDTO(acc)})
+}
+
+func (s *Server) login(c *gin.Context) {
+	var req authReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.fail(c, 400, "invalid json")
+		return
+	}
+	acc, err := s.store.GetAccountByUsername(c.Request.Context(), strings.TrimSpace(req.Username))
+	if err != nil || acc.Status != "active" || !cryptox.CheckPassword(acc.PasswordHash, req.Password) {
+		s.fail(c, 401, "用户名或密码错误")
+		return
+	}
+	tok, acc, err := s.issueSession(c, acc.ID)
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	c.JSON(200, gin.H{"token": tok, "account": accountDTO(acc)})
+}
+
+func (s *Server) logout(c *gin.Context) {
+	tok := readToken(c)
+	if tok != "" && !c.GetBool("break_glass") {
+		_ = s.store.DeleteSession(c.Request.Context(), cryptox.HashAPIKey(tok))
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
+
+func (s *Server) me(c *gin.Context) {
+	if c.GetBool("break_glass") {
+		c.JSON(200, gin.H{"username": "admin", "role": store.RoleAdmin, "break_glass": true})
+		return
+	}
+	acc, ok := s.currentAccount(c)
+	if !ok {
+		s.fail(c, 401, "login required")
+		return
+	}
+	c.JSON(200, accountDTO(acc))
+}
+
+func (s *Server) issueSession(c *gin.Context, accountID int64) (string, store.Account, error) {
+	plain, err := cryptox.RandomString(48)
+	if err != nil {
+		return "", store.Account{}, err
+	}
+	exp := time.Now().Add(sessionTTL).UnixMilli()
+	if err := s.store.InsertSession(c.Request.Context(), cryptox.HashAPIKey(plain), accountID, exp); err != nil {
+		return "", store.Account{}, err
+	}
+	acc, err := s.store.GetAccount(c.Request.Context(), accountID)
+	if err != nil {
+		return "", store.Account{}, err
+	}
+	return plain, acc, nil
+}
+
+func accountDTO(a store.Account) gin.H {
+	return gin.H{
+		"id": a.ID, "username": a.Username, "role": a.Role,
+		"credits": a.Credits, "credits_usd": float64(a.Credits) / float64(store.CreditScale),
 	}
 }
 
@@ -191,7 +379,15 @@ func (s *Server) handleModels(c *gin.Context) {
 }
 
 func (s *Server) adminStats(c *gin.Context) {
-	st, err := s.store.Stats(c.Request.Context())
+	var (
+		st  store.Stats
+		err error
+	)
+	if acc, ok := s.currentAccount(c); ok && !s.isAdmin(c) {
+		st, err = s.store.StatsFor(c.Request.Context(), acc.ID)
+	} else {
+		st, err = s.store.Stats(c.Request.Context())
+	}
 	if err != nil {
 		s.fail(c, 500, err.Error())
 		return
@@ -461,39 +657,84 @@ func (s *Server) adminProbeUpstream(c *gin.Context) {
 }
 
 type userKeyDTO struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	Mask       string `json:"mask"`
-	RPMLimit   int    `json:"rpm_limit"`
-	TokenQuota int64  `json:"token_quota"`
-	TokensUsed int64  `json:"tokens_used"`
-	Status     string `json:"status"`
-	Note       string `json:"note"`
-	ExpiresAt  *int64 `json:"expires_at"`
-	LastUsedAt *int64 `json:"last_used_at"`
-	CreatedAt  int64  `json:"created_at"`
-	Plain      string `json:"plain,omitempty"`
+	ID         int64   `json:"id"`
+	Name       string  `json:"name"`
+	Mask       string  `json:"mask"`
+	RPMLimit   int     `json:"rpm_limit"`
+	TokenQuota int64   `json:"token_quota"`
+	TokensUsed int64   `json:"tokens_used"`
+	Status     string  `json:"status"`
+	Note       string  `json:"note"`
+	ExpiresAt  *int64  `json:"expires_at"`
+	LastUsedAt *int64  `json:"last_used_at"`
+	CreatedAt  int64   `json:"created_at"`
+	OwnerID    *int64  `json:"owner_id"`
+	Credits    *int64  `json:"credits"`
+	CreditsUSD float64 `json:"credits_usd"`
+	Plain      string  `json:"plain,omitempty"`
 }
 
-func toUserDTO(k store.UserKey) userKeyDTO {
-	return userKeyDTO{
+func toUserDTO(k store.UserKey, credits map[int64]int64) userKeyDTO {
+	dto := userKeyDTO{
 		ID: k.ID, Name: k.Name, Mask: k.Mask(), RPMLimit: k.RPMLimit,
 		TokenQuota: k.TokenQuota, TokensUsed: k.TokensUsed, Status: k.Status, Note: k.Note,
 		ExpiresAt: k.ExpiresAt, LastUsedAt: k.LastUsedAt, CreatedAt: k.CreatedAt,
+		OwnerID: k.OwnerID,
 	}
+	if k.OwnerID != nil {
+		if bal, ok := credits[*k.OwnerID]; ok {
+			dto.Credits = &bal
+			dto.CreditsUSD = float64(bal) / float64(store.CreditScale)
+		}
+	}
+	return dto
 }
 
 func (s *Server) adminListKeys(c *gin.Context) {
-	items, err := s.store.ListUserKeys(c.Request.Context())
+	var (
+		items []store.UserKey
+		err   error
+	)
+	if acc, ok := s.currentAccount(c); ok && !s.isAdmin(c) {
+		items, err = s.store.ListUserKeysByOwner(c.Request.Context(), acc.ID)
+	} else {
+		items, err = s.store.ListUserKeys(c.Request.Context())
+	}
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	credits, err := s.ownerCredits(c.Request.Context(), items)
 	if err != nil {
 		s.fail(c, 500, err.Error())
 		return
 	}
 	out := make([]userKeyDTO, 0, len(items))
 	for _, k := range items {
-		out = append(out, toUserDTO(k))
+		out = append(out, toUserDTO(k, credits))
 	}
 	c.JSON(200, gin.H{"items": out})
+}
+
+func (s *Server) ownerCredits(ctx context.Context, items []store.UserKey) (map[int64]int64, error) {
+	out := map[int64]int64{}
+	for _, k := range items {
+		if k.OwnerID == nil {
+			continue
+		}
+		if _, ok := out[*k.OwnerID]; ok {
+			continue
+		}
+		acc, err := s.store.GetAccount(ctx, *k.OwnerID)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[acc.ID] = acc.Credits
+	}
+	return out, nil
 }
 
 type keyReq struct {
@@ -534,16 +775,32 @@ func (s *Server) adminCreateKey(c *gin.Context) {
 	if req.Note != nil {
 		note = strings.TrimSpace(*req.Note)
 	}
-	id, err := s.store.InsertUserKey(c.Request.Context(), store.UserKey{
+	uk := store.UserKey{
 		Name: name, KeyHash: cryptox.HashAPIKey(plain), KeyPrefix: prefix, KeyLast4: last4,
 		RPMLimit: rpm, TokenQuota: quota, Status: "active", Note: note, ExpiresAt: req.ExpiresAt,
-	})
+	}
+	if acc, ok := s.currentAccount(c); ok {
+		owner := acc.ID
+		uk.OwnerID = &owner
+		if !s.isAdmin(c) {
+			if acc.Credits <= 0 {
+				s.fail(c, 402, "积分不足，无法创建 Key")
+				return
+			}
+			uk.TokenQuota = 0
+			if uk.RPMLimit <= 0 || uk.RPMLimit > 120 {
+				uk.RPMLimit = 60
+			}
+		}
+	}
+	id, err := s.store.InsertUserKey(c.Request.Context(), uk)
 	if err != nil {
 		s.fail(c, 500, err.Error())
 		return
 	}
 	k, _ := s.store.GetUserKey(c.Request.Context(), id)
-	dto := toUserDTO(k)
+	credits, _ := s.ownerCredits(c.Request.Context(), []store.UserKey{k})
+	dto := toUserDTO(k, credits)
 	dto.Plain = plain
 	c.JSON(201, dto)
 }
@@ -561,6 +818,14 @@ func (s *Server) adminUpdateKey(c *gin.Context) {
 	}
 	if err != nil {
 		s.fail(c, 500, err.Error())
+		return
+	}
+	if acc, ok := s.currentAccount(c); ok && !s.isAdmin(c) {
+		if cur.OwnerID == nil || *cur.OwnerID != acc.ID {
+			s.fail(c, 404, "not found")
+			return
+		}
+		s.fail(c, 403, "admin only")
 		return
 	}
 	var req keyReq
@@ -597,7 +862,8 @@ func (s *Server) adminUpdateKey(c *gin.Context) {
 		return
 	}
 	k, _ := s.store.GetUserKey(c.Request.Context(), id)
-	c.JSON(200, toUserDTO(k))
+	credits, _ := s.ownerCredits(c.Request.Context(), []store.UserKey{k})
+	c.JSON(200, toUserDTO(k, credits))
 }
 
 func (s *Server) adminDeleteKey(c *gin.Context) {
@@ -605,6 +871,21 @@ func (s *Server) adminDeleteKey(c *gin.Context) {
 	if err != nil {
 		s.fail(c, 400, "bad id")
 		return
+	}
+	cur, err := s.store.GetUserKey(c.Request.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		s.fail(c, 404, "not found")
+		return
+	}
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	if acc, ok := s.currentAccount(c); ok && !s.isAdmin(c) {
+		if cur.OwnerID == nil || *cur.OwnerID != acc.ID {
+			s.fail(c, 404, "not found")
+			return
+		}
 	}
 	if err := s.store.DeleteUserKey(c.Request.Context(), id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -623,6 +904,10 @@ func (s *Server) adminResetKeyUsage(c *gin.Context) {
 		s.fail(c, 400, "bad id")
 		return
 	}
+	if !s.isAdmin(c) {
+		s.fail(c, 403, "admin only")
+		return
+	}
 	if err := s.store.ResetTokens(c.Request.Context(), id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.fail(c, 404, "not found")
@@ -632,7 +917,8 @@ func (s *Server) adminResetKeyUsage(c *gin.Context) {
 		return
 	}
 	k, _ := s.store.GetUserKey(c.Request.Context(), id)
-	c.JSON(200, toUserDTO(k))
+	credits, _ := s.ownerCredits(c.Request.Context(), []store.UserKey{k})
+	c.JSON(200, toUserDTO(k, credits))
 }
 
 func (s *Server) adminLogs(c *gin.Context) {
@@ -640,8 +926,13 @@ func (s *Server) adminLogs(c *gin.Context) {
 	if v := c.Query("user_key_id"); v != "" {
 		f.UserKeyID, _ = strconv.ParseInt(v, 10, 64)
 	}
-	if v := c.Query("upstream_id"); v != "" {
-		f.UpstreamID, _ = strconv.ParseInt(v, 10, 64)
+	if acc, ok := s.currentAccount(c); ok && !s.isAdmin(c) {
+		f.OwnerID = acc.ID
+	}
+	if s.isAdmin(c) {
+		if v := c.Query("upstream_id"); v != "" {
+			f.UpstreamID, _ = strconv.ParseInt(v, 10, 64)
+		}
 	}
 	if v := c.Query("ok"); v != "" {
 		b := v == "1" || v == "true"
@@ -748,7 +1039,21 @@ func (s *Server) adminPlayground(c *gin.Context) {
 		s.fail(c, 400, "read body failed")
 		return
 	}
-	res := s.gw.Evaluate(c.Request.Context(), nil, body, c.GetString("request_id"))
+	var user *store.UserKey
+	if acc, ok := s.currentAccount(c); ok {
+		enough, err := s.store.TrySpendCredits(c.Request.Context(), acc.ID, 0)
+		if err != nil {
+			s.fail(c, 500, err.Error())
+			return
+		}
+		if !enough {
+			s.fail(c, 402, "积分不足")
+			return
+		}
+		owner := acc.ID
+		user = &store.UserKey{OwnerID: &owner}
+	}
+	res := s.gw.Evaluate(c.Request.Context(), user, body, c.GetString("request_id"))
 	status := res.Status
 	if status == 0 {
 		status = 502
@@ -904,4 +1209,223 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func (s *Server) myCredits(c *gin.Context) {
+	if c.GetBool("break_glass") {
+		c.JSON(200, gin.H{"credits": int64(0), "credits_usd": 0, "break_glass": true})
+		return
+	}
+	acc, ok := s.currentAccount(c)
+	if !ok {
+		s.fail(c, 401, "login required")
+		return
+	}
+	fresh, err := s.store.GetAccount(c.Request.Context(), acc.ID)
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	c.JSON(200, gin.H{"credits": fresh.Credits, "credits_usd": float64(fresh.Credits) / float64(store.CreditScale)})
+}
+
+func (s *Server) adminListAccounts(c *gin.Context) {
+	items, err := s.store.ListAccounts(c.Request.Context())
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	out := make([]gin.H, 0, len(items))
+	for _, a := range items {
+		out = append(out, accountDTO(a))
+	}
+	c.JSON(200, gin.H{"items": out})
+}
+
+type creditReq struct {
+	Delta int64  `json:"delta"`
+	Note  string `json:"note"`
+}
+
+func (s *Server) adminAdjustCredits(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		s.fail(c, 400, "bad id")
+		return
+	}
+	var req creditReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.fail(c, 400, "invalid json")
+		return
+	}
+	if req.Delta == 0 {
+		s.fail(c, 400, "delta 不能为 0")
+		return
+	}
+	// delta 单位是积分（美元），内部用微积分。
+	micro := req.Delta * store.CreditScale
+	next, err := s.store.AdjustCredits(c.Request.Context(), id, micro, true)
+	if errors.Is(err, store.ErrNotFound) {
+		s.fail(c, 404, "not found")
+		return
+	}
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	s.log.Info("credits adjusted", "account", id, "delta", req.Delta, "note", req.Note, "credits", next)
+	c.JSON(200, gin.H{"id": id, "credits": next, "credits_usd": float64(next) / float64(store.CreditScale)})
+}
+
+func (s *Server) redeemCode(c *gin.Context) {
+	if c.GetBool("break_glass") {
+		s.fail(c, 400, "应急口令没有账号，不能兑换积分")
+		return
+	}
+	acc, ok := s.currentAccount(c)
+	if !ok {
+		s.fail(c, 401, "login required")
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.fail(c, 400, "invalid json")
+		return
+	}
+	code := normalizeRedeem(req.Code)
+	if code == "" {
+		s.fail(c, 400, "请填写兑换码")
+		return
+	}
+	added, next, err := s.store.RedeemCode(c.Request.Context(), cryptox.HashAPIKey(code), acc.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		s.fail(c, 404, "兑换码无效")
+		return
+	}
+	if errors.Is(err, store.ErrRedeemUsed) {
+		s.fail(c, 409, "兑换码已使用")
+		return
+	}
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	c.JSON(200, gin.H{
+		"added": added, "added_usd": float64(added) / float64(store.CreditScale),
+		"credits": next, "credits_usd": float64(next) / float64(store.CreditScale),
+	})
+}
+
+type redeemBatchReq struct {
+	Credits int64  `json:"credits"`
+	Count   int    `json:"count"`
+	Note    string `json:"note"`
+}
+
+func (s *Server) adminCreateRedeemCodes(c *gin.Context) {
+	var req redeemBatchReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.fail(c, 400, "invalid json")
+		return
+	}
+	if req.Credits <= 0 || req.Credits > 1_000_000 {
+		s.fail(c, 400, "面额须为 1 到 1000000 的整数积分")
+		return
+	}
+	if req.Count < 1 || req.Count > 100 {
+		s.fail(c, 400, "一次生成 1 到 100 个")
+		return
+	}
+	note := clip(strings.TrimSpace(req.Note), 200)
+	var createdBy *int64
+	if acc, ok := s.currentAccount(c); ok {
+		id := acc.ID
+		createdBy = &id
+	}
+	plains := make([]string, 0, req.Count)
+	items := make([]store.RedeemCode, 0, req.Count)
+	seen := map[string]struct{}{}
+	for len(plains) < req.Count {
+		plain, err := newRedeemCode()
+		if err != nil {
+			s.fail(c, 500, err.Error())
+			return
+		}
+		if _, ok := seen[plain]; ok {
+			continue
+		}
+		seen[plain] = struct{}{}
+		plains = append(plains, plain)
+		items = append(items, store.RedeemCode{
+			CodeHash: cryptox.HashAPIKey(plain), CodePrefix: plain[:9],
+			Credits: req.Credits * store.CreditScale, Note: note, CreatedBy: createdBy,
+		})
+	}
+	if err := s.store.InsertRedeemCodes(c.Request.Context(), items); err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	c.JSON(201, gin.H{"credits": req.Credits, "note": note, "codes": plains})
+}
+
+func (s *Server) adminListRedeemCodes(c *gin.Context) {
+	items, err := s.store.ListRedeemCodes(c.Request.Context(), 100)
+	if err != nil {
+		s.fail(c, 500, err.Error())
+		return
+	}
+	out := make([]gin.H, 0, len(items))
+	for _, it := range items {
+		out = append(out, gin.H{
+			"id": it.ID, "prefix": it.CodePrefix,
+			"credits": it.Credits, "credits_usd": float64(it.Credits) / float64(store.CreditScale),
+			"note": it.Note, "created_by": it.CreatedBy, "redeemed_by": it.RedeemedBy,
+			"redeemed_at": it.RedeemedAt, "created_at": it.CreatedAt,
+		})
+	}
+	c.JSON(200, gin.H{"items": out})
+}
+
+func newRedeemCode() (string, error) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	raw := make([]byte, 12)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	b.WriteString("RC-")
+	for i, x := range raw {
+		if i > 0 && i%4 == 0 {
+			b.WriteByte('-')
+		}
+		b.WriteByte(alphabet[int(x)%len(alphabet)])
+	}
+	return b.String(), nil
+}
+
+func normalizeRedeem(s string) string {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if r == '-' || r == ' ' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	compact := b.String()
+	if !strings.HasPrefix(compact, "RC") || len(compact) != 14 {
+		return ""
+	}
+	body := compact[2:]
+	for _, r := range body {
+		if (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return ""
+		}
+	}
+	return "RC-" + body[:4] + "-" + body[4:8] + "-" + body[8:]
 }

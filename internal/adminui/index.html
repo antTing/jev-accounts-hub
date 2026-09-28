@@ -310,39 +310,41 @@
         style="display: flex; gap: 10px; align-items: center"
       >
         <span class="muted">交流群 1102910606</span>
+        <span class="muted" id="creditState"></span>
         <span class="muted" id="authState">未登录</span>
         <button class="ghost" onclick="logout()">退出</button>
       </div>
     </header>
     <main>
       <div id="gate" class="gate">
-        <h2>先贴管理口令</h2>
-        <p>
-          服务启动时会把口令写到项目目录的
-          <code>data/admin.token</code>。在终端执行：
-        </p>
-        <p><code>cat data/admin.token</code></p>
-        <p>把整行复制到下面。不要贴 TypeSafe 的 <code>jev_</code> Key。</p>
-        <input
-          id="token"
-          type="password"
-          placeholder="data/admin.token 里的那一行"
-          autocomplete="off"
-        />
-        <button onclick="saveToken()">进入管理台</button>
+        <h2 id="gateTitle">登录</h2>
+        <p id="gateHint" class="muted">管理员和普通用户分开登录。第一个注册的账号是管理员。</p>
+        <label>用户名</label>
+        <input id="loginUser" autocomplete="username" placeholder="3-32 位" />
+        <label>密码</label>
+        <input id="loginPass" type="password" autocomplete="current-password" placeholder="至少 8 位" />
+        <div class="toolbar" style="margin-top: 12px">
+          <button onclick="submitAuth('login')">登录</button>
+          <button class="ghost" onclick="submitAuth('register')">注册</button>
+        </div>
+        <p class="muted" style="margin-top: 16px">也可以贴 <code>data/admin.token</code> 应急进入（管理员）。</p>
+        <input id="token" type="password" placeholder="管理口令（可选）" autocomplete="off" />
+        <button class="ghost" onclick="saveToken()">用口令进入</button>
         <p class="msg" id="gateErr"></p>
         <p class="muted" style="margin-top: 18px">交流 QQ 群：1102910606</p>
       </div>
       <div id="app" class="hidden">
         <div class="row" id="stats"></div>
         <div class="tabs">
-          <button class="on" data-tab="upstreams" onclick="tab(this)">
+          <button class="on admin-only" data-tab="upstreams" onclick="tab(this)">
             上游 Key
           </button>
-          <button data-tab="proxies" onclick="tab(this)">代理池</button>
+          <button class="admin-only" data-tab="proxies" onclick="tab(this)">代理池</button>
           <button data-tab="keys" onclick="tab(this)">用户 Key</button>
           <button data-tab="logs" onclick="tab(this)">调用日志</button>
           <button data-tab="play" onclick="tab(this)">试玩</button>
+          <button data-tab="redeem" onclick="tab(this)">兑换积分</button>
+          <button class="admin-only" data-tab="accounts" onclick="tab(this)">账号积分</button>
         </div>
         <section id="upstreams">
           <div class="toolbar">
@@ -373,9 +375,10 @@
         </section>
         <section id="keys" class="hidden">
           <div class="toolbar">
-            <button onclick="openKey()">签发用户 Key</button>
+            <button onclick="openKey()">创建 API Key</button>
             <button class="ghost" onclick="loadAll()">刷新</button>
           </div>
+          <p class="muted" id="keyHint"></p>
           <div id="newPlain"></div>
           <div class="card"><table id="keyTable"></table></div>
           <div class="pager" id="keyPager"></div>
@@ -394,12 +397,14 @@
               <option value="false">仅失败</option>
             </select>
             <input
+              class="admin-only"
               id="logUser"
               placeholder="用户 Key ID"
               style="width: 120px"
               onkeydown="if(event.key==='Enter')resetLogs()"
             />
             <input
+              class="admin-only"
               id="logUp"
               placeholder="上游 ID"
               style="width: 100px"
@@ -412,9 +417,40 @@
               onkeydown="if(event.key==='Enter')resetLogs()"
             />
             <button class="ghost" onclick="resetLogs()">筛选</button>
+            <button class="ghost" onclick="loadLogs()">刷新</button>
           </div>
           <div class="card"><table id="logTable"></table></div>
           <div class="pager" id="logPager"></div>
+        </section>
+        <section id="redeem" class="hidden">
+          <div class="card" style="max-width: 520px">
+            <div class="k">兑换码</div>
+            <label>兑换码</label>
+            <input id="redeemCode" placeholder="RC-XXXX-XXXX-XXXX" autocomplete="off" />
+            <div class="toolbar" style="margin-top: 12px">
+              <button onclick="redeem()">兑换</button>
+            </div>
+            <p class="muted">兑换后记入当前账号余额。1 积分 = $1。应急口令没有账号，不能兑换。</p>
+          </div>
+          <div class="admin-only" style="margin-top: 16px">
+            <div class="toolbar">
+              <input id="codeCredits" type="number" min="1" step="1" value="10" style="width: 120px" />
+              <input id="codeCount" type="number" min="1" max="100" step="1" value="1" style="width: 90px" />
+              <input id="codeNote" placeholder="备注，可选" style="min-width: 160px" />
+              <button onclick="createCodes()">生成兑换码</button>
+              <button class="ghost" onclick="loadCodes()">刷新</button>
+            </div>
+            <p class="muted">面额是整数积分（美元），一次最多 100 个。明文只显示这一次，之后列表只留前缀。</p>
+            <pre id="newCodes" class="hidden"></pre>
+            <div class="card"><table id="codeTable"></table></div>
+          </div>
+        </section>
+        <section id="accounts" class="hidden">
+          <div class="toolbar">
+            <button class="ghost" onclick="loadAccounts()">刷新</button>
+          </div>
+          <p class="muted">1 积分 = $1 调用额度。正数充值，负数扣减。调用按 $42 / 十亿 input tokens 扣积分。</p>
+          <div class="card"><table id="acctTable"></table></div>
         </section>
         <section id="play" class="hidden">
           <div class="split">
@@ -441,8 +477,7 @@ Stripe linking has failed for days.</textarea
                 <button class="ghost" onclick="fillPlay()">填默认</button>
               </div>
               <p class="muted">
-                走管理接口，不消耗用户 Key
-                配额。仍会计入调用日志（user_key_id=0）。
+                用当前账号的积分试一次，按 $42 / 十亿 input tokens 扣。余额为 0 时不能试。应急口令没有账号，不扣积分。
               </p>
             </div>
             <div class="card">
@@ -561,7 +596,7 @@ Stripe linking has failed for days.</textarea
     </dialog>
     <dialog id="keyDlg">
       <form method="dialog" onsubmit="return false">
-        <h3 style="margin: 0 0 8px">签发用户 Key</h3>
+        <h3 style="margin: 0 0 8px" id="keyDlgTitle">创建 API Key</h3>
         <label>名称</label
         ><input id="keyName" placeholder="alice / sdk-prod" />
         <label>备注</label><input id="keyNote" placeholder="发给谁、用在哪" />
@@ -569,11 +604,12 @@ Stripe linking has failed for days.</textarea
           <div>
             <label>RPM</label><input id="keyRpm" type="number" value="60" />
           </div>
-          <div>
+          <div class="admin-only" id="keyQuotaWrap">
             <label>token 配额（0=不限）</label
             ><input id="keyQuota" type="number" value="0" />
           </div>
         </div>
+        <p class="muted" id="keyDlgHint"></p>
         <div class="toolbar" style="margin-top: 12px">
           <button onclick="saveKey()">签发</button>
           <button
@@ -587,9 +623,13 @@ Stripe linking has failed for days.</textarea
     </dialog>
     <script>
       const $ = (id) => document.getElementById(id);
+      let me = null;
       $("token").value = localStorage.getItem("jev_admin") || "";
       $("token").addEventListener("keydown", (e) => {
         if (e.key === "Enter") saveToken();
+      });
+      $("loginPass").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") submitAuth("login");
       });
 
       function token() {
@@ -603,7 +643,7 @@ Stripe linking has failed for days.</textarea
           .querySelectorAll(".tabs button")
           .forEach((b) => b.classList.remove("on"));
         btn.classList.add("on");
-        ["upstreams", "proxies", "keys", "logs", "play"].forEach((id) =>
+        ["upstreams", "proxies", "keys", "logs", "play", "redeem", "accounts"].forEach((id) =>
           $(id).classList.toggle("hidden", id !== btn.dataset.tab)
         );
       }
@@ -679,11 +719,57 @@ Stripe linking has failed for days.</textarea
       function err(e) {
         $("err").textContent = e || "";
       }
+      function isAdmin() {
+        return !!(me && me.role === "admin");
+      }
+      function applyRole() {
+        document.querySelectorAll(".admin-only").forEach((el) => {
+          el.classList.toggle("hidden", !isAdmin());
+        });
+        const tabs = [...document.querySelectorAll(".tabs button")].filter(
+          (b) => !b.classList.contains("hidden")
+        );
+        if (!tabs.some((b) => b.classList.contains("on")) && tabs[0]) tab(tabs[0]);
+        const label = me
+          ? me.username + (isAdmin() ? " · 管理员" : " · 用户")
+          : "未登录";
+        $("authState").textContent = label;
+        const usd =
+          me && me.credits != null
+            ? (Number(me.credits) / 1e6).toFixed(4)
+            : "";
+        $("creditState").textContent = me ? "积分 $" + usd : "";
+      }
       function showApp(on) {
         $("gate").classList.toggle("hidden", on);
         $("app").classList.toggle("hidden", !on);
         $("headerAuth").classList.toggle("hidden", !on);
-        $("authState").textContent = on ? "已登录" : "未登录";
+        if (!on) me = null;
+        applyRole();
+      }
+      async function submitAuth(kind) {
+        $("gateErr").textContent = "";
+        const username = $("loginUser").value.trim();
+        const password = $("loginPass").value;
+        try {
+          const r = await fetch("/admin/api/" + kind, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username, password }),
+          });
+          const t = await r.text();
+          let j = null;
+          try { j = JSON.parse(t); } catch {}
+          if (!r.ok) throw new Error((j && j.error && j.error.message) || t || r.status);
+          localStorage.setItem("jev_admin", j.token);
+          me = j.account;
+          showApp(true);
+          await loadAll();
+        } catch (e) {
+          localStorage.removeItem("jev_admin");
+          showApp(false);
+          $("gateErr").textContent = e.message;
+        }
       }
       async function api(path, opt = {}) {
         const r = await fetch("/admin/api" + path, {
@@ -708,19 +794,22 @@ Stripe linking has failed for days.</textarea
         }
         localStorage.setItem("jev_admin", v);
         try {
-          await api("/stats");
+          me = await api("/me");
           showApp(true);
           await loadAll();
         } catch (e) {
           localStorage.removeItem("jev_admin");
+          me = null;
           showApp(false);
-          $("gateErr").textContent =
-            "口令不对。在运行 jevproxy 的目录执行：\ncat data/admin.token\n把输出整行贴进来。不要贴 jev_ 开头的 TypeSafe Key。";
+          $("gateErr").textContent = "登录失败：" + e.message;
         }
       }
-      function logout() {
+      async function logout() {
+        try { await api("/logout", { method: "POST" }); } catch (e) {}
         localStorage.removeItem("jev_admin");
         $("token").value = "";
+        $("loginPass").value = "";
+        me = null;
         showApp(false);
       }
       function n(v) {
@@ -738,22 +827,16 @@ Stripe linking has failed for days.</textarea
         );
       }
       function quotaCell(x) {
-        const used = Number(x.tokens_used || 0);
-        const quota = Number(x.token_quota || 0);
-        if (!quota) {
-          return n(used) + ' <span class="muted">/ 不限</span>';
+        if (x.owner_id == null || x.credits == null) {
+          return '<span class="muted">不扣积分</span>';
         }
-        const left = quota - used;
-        const cls = left <= 0 ? "bad" : left <= quota * 0.1 ? "warn" : "ok";
+        const usd = Number(x.credits) / 1e6;
+        const cls = usd <= 0 ? "bad" : usd < 1 ? "warn" : "ok";
         return (
-          n(used) +
-          ' <span class="muted">/ ' +
-          n(quota) +
-          "</span>" +
           '<div class="' +
           cls +
-          '">剩余 ' +
-          n(left) +
+          '">剩余 $' +
+          usd.toFixed(4) +
           "</div>"
         );
       }
@@ -786,9 +869,12 @@ Stripe linking has failed for days.</textarea
       async function loadAll() {
         err("");
         try {
+          if (!me) me = await api("/me");
+          applyRole();
           const s = await api("/stats");
-          $("stats").innerHTML =
-            [
+          const cards = [];
+          if (isAdmin()) {
+            cards.push(
               [
                 "上游",
                 s.upstreams_live + " / " + s.upstreams,
@@ -798,7 +884,10 @@ Stripe linking has failed for days.</textarea
                 "代理",
                 (s.proxies_live || 0) + " / " + (s.proxies || 0),
                 "活跃 / 全部",
-              ],
+              ]
+            );
+          }
+          cards.push(
               ["用户 Key", s.user_keys_live + " / " + s.user_keys, ""],
               [
                 "24h 请求",
@@ -813,8 +902,10 @@ Stripe linking has failed for days.</textarea
                   "ms · p95 " +
                   (s.latency_p95 || 0) +
                   "ms",
-              ],
-            ]
+              ]
+          );
+          $("stats").innerHTML =
+            cards
               .map(
                 ([k, v, sub]) =>
                   '<div class="card"><div class="k">' +
@@ -829,6 +920,7 @@ Stripe linking has failed for days.</textarea
             '<div class="card" style="grid-column:1/-1"><div class="k">24h 按小时</div>' +
             spark(s.hourly) +
             "</div>";
+          if (isAdmin()) {
           const px = await api("/proxies");
           window._proxies = px.items || [];
           fillProxySelect($("upProxy"), "");
@@ -982,6 +1074,7 @@ Stripe linking has failed for days.</textarea
               .join("");
           renderPager("upPager", pages.up, upPage.total, renderUp);
           }
+          }
           const k = await api("/keys");
           window._keys = k.items || [];
           renderKeys();
@@ -1014,19 +1107,21 @@ Stripe linking has failed for days.</textarea
                   x.status +
                   "</td>" +
                   "<td>" +
-                  '<button class="ghost" onclick="toggleKey(' +
-                  x.id +
-                  ",'" +
-                  x.status +
-                  "')\">" +
-                  (x.status === "active" ? "停用" : "启用") +
-                  "</button> " +
-                  '<button class="ghost" onclick="editNote(' +
-                  x.id +
-                  ')">备注</button> ' +
-                  '<button class="ghost" onclick="resetKey(' +
-                  x.id +
-                  ')">清零用量</button> ' +
+                  (isAdmin()
+                    ? '<button class="ghost" onclick="toggleKey(' +
+                      x.id +
+                      ",'" +
+                      x.status +
+                      "')\">" +
+                      (x.status === "active" ? "停用" : "启用") +
+                      "</button> " +
+                      '<button class="ghost" onclick="editNote(' +
+                      x.id +
+                      ')">备注</button> ' +
+                      '<button class="ghost" onclick="resetKey(' +
+                      x.id +
+                      ')">清零用量</button> '
+                    : "") +
                   '<button class="danger" onclick="delKey(' +
                   x.id +
                   ')">删除</button>' +
@@ -1036,6 +1131,11 @@ Stripe linking has failed for days.</textarea
           renderPager("keyPager", pages.key, keyPage.total, renderKeys);
           }
           await loadLogs();
+          if (isAdmin()) {
+            await loadAccounts();
+            await loadCodes();
+          }
+          await refreshMe();
         } catch (e) {
           err(e.message);
         }
@@ -1160,7 +1260,144 @@ Stripe linking has failed for days.</textarea
       function openKey() {
         $("keyName").value = "";
         $("keyNote").value = "";
+        $("keyRpm").value = "60";
+        if ($("keyQuota")) $("keyQuota").value = "0";
+        $("keyDlgTitle").textContent = isAdmin() ? "签发用户 Key" : "创建 API Key";
+        $("keyDlgHint").textContent = isAdmin()
+          ? "管理员签发的 Key 记在当前账号名下。"
+          : "Key 只消耗你自己的积分。1 积分 = $1，按 $42 / 十亿 input tokens 扣。";
+        if ($("keyHint")) {
+          $("keyHint").textContent = isAdmin()
+            ? ""
+            : "你只能看到并使用自己创建的 Key。余额为 0 时不能新建。";
+        }
         $("keyDlg").showModal();
+      }
+      async function redeem() {
+        const code = $("redeemCode").value.trim();
+        if (!code) {
+          err("请填写兑换码");
+          return;
+        }
+        try {
+          const r = await api("/redeem", {
+            method: "POST",
+            body: JSON.stringify({ code }),
+          });
+          $("redeemCode").value = "";
+          err("");
+          alert("已兑换 $" + Number(r.added_usd || 0).toFixed(2) + "，余额 $" + Number(r.credits_usd || 0).toFixed(4));
+          await refreshMe();
+          if (isAdmin()) await loadCodes();
+        } catch (e) {
+          err(e.message);
+        }
+      }
+      async function createCodes() {
+        const credits = Number($("codeCredits").value);
+        const count = Number($("codeCount").value);
+        if (!Number.isInteger(credits) || credits <= 0) {
+          err("面额请填正整数");
+          return;
+        }
+        if (!Number.isInteger(count) || count < 1 || count > 100) {
+          err("数量为 1 到 100");
+          return;
+        }
+        try {
+          const r = await api("/redeem-codes", {
+            method: "POST",
+            body: JSON.stringify({
+              credits,
+              count,
+              note: $("codeNote").value.trim(),
+            }),
+          });
+          const box = $("newCodes");
+          box.classList.remove("hidden");
+          box.textContent = (r.codes || []).join("\n");
+          err("");
+          await loadCodes();
+        } catch (e) {
+          err(e.message);
+        }
+      }
+      async function loadCodes() {
+        if (!isAdmin()) return;
+        const r = await api("/redeem-codes");
+        $("codeTable").innerHTML =
+          "<tr><th>前缀</th><th>面额 ($)</th><th>备注</th><th>状态</th><th>创建</th></tr>" +
+          (r.items || [])
+            .map((c) => {
+              const used = c.redeemed_at
+                ? "已用 · 账号 " + c.redeemed_by
+                : "未使用";
+              return (
+                "<tr><td>" +
+                esc(c.prefix) +
+                "</td><td>" +
+                Number(c.credits_usd || 0).toFixed(2) +
+                '</td><td class="muted">' +
+                esc(c.note || "") +
+                "</td><td>" +
+                used +
+                "</td><td>" +
+                ts(c.created_at) +
+                "</td></tr>"
+              );
+            })
+            .join("");
+      }
+      async function refreshMe() {
+        try {
+          const fresh = await api("/me");
+          if (fresh && fresh.username) me = fresh;
+          applyRole();
+        } catch (e) {}
+      }
+      async function loadAccounts() {
+        if (!isAdmin()) return;
+        const r = await api("/accounts");
+        $("acctTable").innerHTML =
+          "<tr><th>ID</th><th>用户名</th><th>角色</th><th>积分 ($)</th><th>调整</th></tr>" +
+          (r.items || [])
+            .map(
+              (a) =>
+                "<tr><td>" +
+                a.id +
+                "</td><td>" +
+                esc(a.username) +
+                "</td><td>" +
+                esc(a.role) +
+                "</td><td>" +
+                Number(a.credits_usd || 0).toFixed(4) +
+                '</td><td><input id="cred' +
+                a.id +
+                '" type="number" step="1" placeholder="+10 或 -2" style="width:110px"/> ' +
+                '<button class="ghost" onclick="adjustCredits(' +
+                a.id +
+                ')">确定</button></td></tr>'
+            )
+            .join("");
+      }
+      async function adjustCredits(id) {
+        const raw = $("cred" + id).value.trim();
+        const delta = Number(raw);
+        if (!raw || !Number.isFinite(delta) || delta === 0 || !Number.isInteger(delta)) {
+          err("积分调整请填非 0 整数，单位是美元");
+          return;
+        }
+        try {
+          await api("/accounts/" + id + "/credits", {
+            method: "POST",
+            body: JSON.stringify({ delta }),
+          });
+          err("");
+          await loadAccounts();
+          await refreshMe();
+        } catch (e) {
+          err(e.message);
+        }
       }
       async function saveUp() {
         try {
@@ -1420,7 +1657,12 @@ Stripe linking has failed for days.</textarea
             r.input_tokens +
             (r.model ? " · " + r.model : "");
           $("playOut").textContent = JSON.stringify(r.body || r, null, 2);
-          loadLogs();
+          if (r.ok) {
+            await refreshMe();
+            await loadAll();
+          } else {
+            loadLogs();
+          }
         } catch (e) {
           $("playMeta").textContent = "失败";
           $("playOut").textContent = e.message;
@@ -1440,6 +1682,7 @@ Stripe linking has failed for days.</textarea
         );
       }
       if (token()) saveToken();
+      else showApp(false);
     </script>
   </body>
 </html>

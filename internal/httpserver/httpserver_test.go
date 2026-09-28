@@ -191,6 +191,331 @@ func TestAdminAuth(t *testing.T) {
 	}
 }
 
+func authJSON(h http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, rdr)
+	if token != "" {
+		req.Header.Set("X-Admin-Token", token)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestAccountRoles(t *testing.T) {
+	s, st := testServer(t, "http://127.0.0.1:1")
+	h := s.Handler()
+
+	rec := authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"root","password":"password1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("register admin %d %s", rec.Code, rec.Body.String())
+	}
+	var admin struct {
+		Token   string `json:"token"`
+		Account struct {
+			Role string `json:"role"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &admin); err != nil {
+		t.Fatal(err)
+	}
+	if admin.Account.Role != "admin" || admin.Token == "" {
+		t.Fatalf("admin %+v", admin)
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"alice","password":"password1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("register user %d %s", rec.Code, rec.Body.String())
+	}
+	var user struct {
+		Token   string `json:"token"`
+		Account struct {
+			ID   int64  `json:"id"`
+			Role string `json:"role"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &user); err != nil {
+		t.Fatal(err)
+	}
+	if user.Account.Role != "user" {
+		t.Fatalf("user role %+v", user)
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/login", "", `{"username":"alice","password":"nopepass1"}`)
+	if rec.Code != 401 {
+		t.Fatalf("bad login %d", rec.Code)
+	}
+
+	rec = authJSON(h, http.MethodGet, "/admin/api/upstreams", user.Token, "")
+	if rec.Code != 403 {
+		t.Fatalf("user upstreams %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodGet, "/admin/api/upstreams", admin.Token, "")
+	if rec.Code != 200 {
+		t.Fatalf("admin upstreams %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/keys", user.Token, `{"name":"broke"}`)
+	if rec.Code != 402 {
+		t.Fatalf("broke key %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/accounts/"+itoa(user.Account.ID)+"/credits", admin.Token, `{"delta":2}`)
+	if rec.Code != 200 {
+		t.Fatalf("credit %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/keys", user.Token, `{"name":"mine"}`)
+	if rec.Code != 201 {
+		t.Fatalf("user key %d %s", rec.Code, rec.Body.String())
+	}
+	var mine struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &mine); err != nil {
+		t.Fatal(err)
+	}
+	k, err := st.GetUserKey(context.Background(), mine.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k.OwnerID == nil || *k.OwnerID != user.Account.ID {
+		t.Fatalf("owner %+v want %d", k.OwnerID, user.Account.ID)
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/keys", admin.Token, `{"name":"other"}`)
+	if rec.Code != 201 {
+		t.Fatalf("admin key %d %s", rec.Code, rec.Body.String())
+	}
+	var other struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &other); err != nil {
+		t.Fatal(err)
+	}
+
+	rec = authJSON(h, http.MethodGet, "/admin/api/keys", user.Token, "")
+	if rec.Code != 200 {
+		t.Fatalf("list %d %s", rec.Code, rec.Body.String())
+	}
+	var listed struct {
+		Items []struct {
+			ID         int64   `json:"id"`
+			Credits    *int64  `json:"credits"`
+			CreditsUSD float64 `json:"credits_usd"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Items) != 1 || listed.Items[0].ID != mine.ID {
+		t.Fatalf("scoped keys %+v", listed.Items)
+	}
+	if listed.Items[0].Credits == nil || *listed.Items[0].Credits != 2*store.CreditScale || listed.Items[0].CreditsUSD != 2 {
+		t.Fatalf("key credits %+v", listed.Items[0])
+	}
+
+	rec = authJSON(h, http.MethodDelete, "/admin/api/keys/"+itoa(other.ID), user.Token, "")
+	if rec.Code != 404 {
+		t.Fatalf("user delete other %d %s", rec.Code, rec.Body.String())
+	}
+	if err := st.InsertLog(context.Background(), store.UsageLog{UserKeyID: mine.ID, OK: true, StatusCode: 200, Model: "jev"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertLog(context.Background(), store.UsageLog{UserKeyID: other.ID, OK: true, StatusCode: 200, Model: "jev"}); err != nil {
+		t.Fatal(err)
+	}
+	rec = authJSON(h, http.MethodGet, "/admin/api/logs", user.Token, "")
+	if rec.Code != 200 {
+		t.Fatalf("logs %d %s", rec.Code, rec.Body.String())
+	}
+	var logs struct {
+		Total int              `json:"total"`
+		Items []store.UsageLog `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &logs); err != nil {
+		t.Fatal(err)
+	}
+	if logs.Total != 1 || len(logs.Items) != 1 || logs.Items[0].UserKeyID != mine.ID {
+		t.Fatalf("scoped logs %+v", logs)
+	}
+}
+
+func TestRedeemCodes(t *testing.T) {
+	s, st := testServer(t, "http://127.0.0.1:1")
+	h := s.Handler()
+
+	rec := authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"root","password":"password1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("admin %d %s", rec.Code, rec.Body.String())
+	}
+	var admin struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &admin); err != nil {
+		t.Fatal(err)
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"alice","password":"password1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("user %d %s", rec.Code, rec.Body.String())
+	}
+	var user struct {
+		Token   string `json:"token"`
+		Account struct {
+			ID int64 `json:"id"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &user); err != nil {
+		t.Fatal(err)
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/redeem-codes", user.Token, `{"credits":5,"count":1}`)
+	if rec.Code != 403 {
+		t.Fatalf("user create %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/redeem", "admintok", `{"code":"RC-ABCD-EFGH-JKLM"}`)
+	if rec.Code != 400 {
+		t.Fatalf("break glass %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/redeem-codes", admin.Token, `{"credits":5,"count":2,"note":"batch"}`)
+	if rec.Code != 201 {
+		t.Fatalf("create %d %s", rec.Code, rec.Body.String())
+	}
+	var batch struct {
+		Codes []string `json:"codes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &batch); err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Codes) != 2 || normalizeRedeem(batch.Codes[0]) == "" {
+		t.Fatalf("codes %+v", batch.Codes)
+	}
+
+	messy := strings.ToLower(strings.ReplaceAll(batch.Codes[0], "-", " "))
+	rec = authJSON(h, http.MethodPost, "/admin/api/redeem", user.Token, `{"code":"`+messy+`"}`)
+	if rec.Code != 200 {
+		t.Fatalf("redeem %d %s", rec.Code, rec.Body.String())
+	}
+	var redeemed struct {
+		AddedUSD   float64 `json:"added_usd"`
+		CreditsUSD float64 `json:"credits_usd"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &redeemed); err != nil {
+		t.Fatal(err)
+	}
+	if redeemed.AddedUSD != 5 || redeemed.CreditsUSD != 5 {
+		t.Fatalf("balance %+v", redeemed)
+	}
+	acc, err := st.GetAccount(context.Background(), user.Account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Credits != 5*store.CreditScale {
+		t.Fatalf("stored %d", acc.Credits)
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/redeem", user.Token, `{"code":"`+batch.Codes[0]+`"}`)
+	if rec.Code != 409 {
+		t.Fatalf("reuse %d %s", rec.Code, rec.Body.String())
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/redeem", user.Token, `{"code":"nope"}`)
+	if rec.Code != 400 {
+		t.Fatalf("bad code %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = authJSON(h, http.MethodGet, "/admin/api/redeem-codes", admin.Token, "")
+	if rec.Code != 200 {
+		t.Fatalf("list %d %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"redeemed_by":`+itoa(user.Account.ID))) {
+		t.Fatalf("list body %s", rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(batch.Codes[0])) {
+		t.Fatalf("plaintext leaked %s", rec.Body.String())
+	}
+}
+
+func TestPlaygroundSpendsAccountCredits(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"jev-1.13.0","answers":{"ok":{"noul":1}},"usage":{"input_tokens":1000,"output_tokens":4}}`)
+	}))
+	defer up.Close()
+
+	s, st := testServer(t, up.URL)
+	h := s.Handler()
+	body := `{"state":"hi","model":"jev-latest","questions":{"ok":{"type":"noul","instructions":"x"}}}`
+
+	rec := adminReq(h, http.MethodPost, "/admin/api/upstreams", `{"name":"u","api_key":"jev_play1111"}`)
+	if rec.Code != 201 {
+		t.Fatalf("upstream %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/register", "", `{"username":"alice","password":"password1"}`)
+	if rec.Code != 201 {
+		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
+	}
+	var user struct {
+		Token   string `json:"token"`
+		Account struct {
+			ID int64 `json:"id"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &user); err != nil {
+		t.Fatal(err)
+	}
+
+	rec = authJSON(h, http.MethodPost, "/admin/api/playground", user.Token, body)
+	if rec.Code != 402 {
+		t.Fatalf("broke play %d %s", rec.Code, rec.Body.String())
+	}
+
+	if _, err := st.AdjustCredits(context.Background(), user.Account.ID, 2*store.CreditScale, true); err != nil {
+		t.Fatal(err)
+	}
+	rec = authJSON(h, http.MethodPost, "/admin/api/playground", user.Token, body)
+	if rec.Code != 200 {
+		t.Fatalf("play %d %s", rec.Code, rec.Body.String())
+	}
+	var play map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &play); err != nil {
+		t.Fatal(err)
+	}
+	if play["ok"] != true {
+		t.Fatalf("play %+v", play)
+	}
+	acc, err := st.GetAccount(context.Background(), user.Account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1000 input tokens * $42 / 1e9 = 42 micro-credits.
+	want := 2*store.CreditScale - 42
+	if acc.Credits != want {
+		t.Fatalf("credits %d want %d", acc.Credits, want)
+	}
+
+	before, err := st.GetAccount(context.Background(), user.Account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec = adminReq(h, http.MethodPost, "/admin/api/playground", body)
+	if rec.Code != 200 {
+		t.Fatalf("break-glass play %d %s", rec.Code, rec.Body.String())
+	}
+	after, err := st.GetAccount(context.Background(), user.Account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Credits != before.Credits {
+		t.Fatalf("break-glass billed %d -> %d", before.Credits, after.Credits)
+	}
+}
+
 func TestPlaygroundValidatesBody(t *testing.T) {
 	s, _ := testServer(t, "http://127.0.0.1:1")
 	rec := adminReq(s.Handler(), http.MethodPost, "/admin/api/playground", `{"foo":1}`)
