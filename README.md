@@ -189,6 +189,22 @@ JEVPROXY_UPSTREAM=https://api.typesafe.ai
 JEVPROXY_TIMEOUT=15s
 ```
 
+## Codex / MCP Integration
+
+This repository includes a small stdio MCP bridge at `cmd/jev-mcp`. The
+user-level Codex MCP entry named `jev` exposes its `jev_decide` tool from any
+project, so Codex can ask Jev for narrow typed judgments while keeping its
+normal coding model and tool execution unchanged.
+
+The bridge sends the native `POST /v1/systemone` request to the local gateway.
+It reads `TYPESAFE_API_KEY` and `TYPESAFE_BASE_URL` from the process environment;
+when those are absent, it falls back to `~/.codex/.env` (or the path in
+`TYPESAFE_DOTENV`). No credentials are stored in this repository.
+
+Start the gateway first, then open a new Codex task (or reopen an existing one)
+so its MCP tool catalog is reloaded. The bridge is intentionally a decision
+tool, not an OpenAI-compatible model provider.
+
 ## Community
 
 QQ 群：`1102910606`
